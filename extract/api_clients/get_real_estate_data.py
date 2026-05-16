@@ -42,12 +42,14 @@ else:
 
     # Zapisujemy plik ze sprzedażą
     if sell_dataframes:
+        print(len(sell_dataframes))
         merged_sell = pd.concat(sell_dataframes, ignore_index=True)
         merged_sell.to_csv(sell_target_path, index=False)
         print(f"Sukces! Sprzedaż ({len(merged_sell)} wierszy) zapisana w: {sell_target_path}")
 
     # Zapisujemy plik z wynajmem
     if rent_dataframes:
+        print(len(rent_dataframes))
         merged_rent = pd.concat(rent_dataframes, ignore_index=True)
         merged_rent.to_csv(rent_target_path, index=False)
         print(f"Sukces! Wynajem ({len(merged_rent)} wierszy) zapisany w: {rent_target_path}")
