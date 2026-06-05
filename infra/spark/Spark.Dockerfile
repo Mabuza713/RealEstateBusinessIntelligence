@@ -18,9 +18,9 @@ ENV PATH="${SPARK_HOME}/bin:${SPARK_HOME}/python:${JAVA_HOME}/bin:${PATH}" \
 
 ARG DEVCONTAINER
 
-# Dodano build-essential i python3-dev, aby zapobiec błędom kompilacji 'wheel'
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv python-is-python3 \
+    python3.10 python3.10-venv python3.10-dev \
     build-essential python3-dev \
     openjdk-${JAVA_VERSION}-jre-headless \
     curl wget vim sudo whois ca-certificates-java procps nvidia-utils-525 \
@@ -45,6 +45,8 @@ spark.eventLog.dir file://${SPARK_HOME}/event_logs
 spark.history.fs.logDirectory file://${SPARK_HOME}/event_logs
 spark.plugins com.nvidia.spark.SQLPlugin
 spark.sql.execution.arrow.pyspark.enabled true
+spark.pyspark.python /usr/bin/python3.10
+spark.pyspark.driver.python /usr/bin/python3.10
 EOF
 
 COPY infra/spark/entrypoint.sh ${SPARK_HOME}/entrypoint.sh
@@ -58,12 +60,10 @@ WORKDIR $APP_HOME
 COPY --chown=$USERNAME:$USERNAME requirements.txt ./
 COPY --chown=$USERNAME:$USERNAME scripts/ ./scripts/
 
-# Zmienne dla Airflow (Ubuntu 22.04 używa Pythona 3.10)
 ARG AIRFLOW_VERSION=2.9.1
 ARG PYTHON_VERSION=3.10
 ARG CONSTRAINT_URL="https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
 
-# Poprawiona instalacja z użyciem constraint files dla Airflow
 RUN python3 -m venv .venv \
     && .venv/bin/pip install --no-cache-dir --upgrade pip \
     && .venv/bin/pip install --no-cache-dir "apache-airflow==${AIRFLOW_VERSION}" --constraint "${CONSTRAINT_URL}" \

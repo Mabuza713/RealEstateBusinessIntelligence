@@ -1,8 +1,8 @@
-FROM apache/airflow:3.2.0
+FROM apache/airflow:3.2.0-python3.10
 
 USER root
 
-ENV SPARK_VERSION=3.5.2 \
+ENV SPARK_VERSION=3.5.1 \
     HADOOP_VERSION=3 \
     HADOOP_JAR_VERSION=3.3.4 \
     AWS_SDK_VERSION=1.12.262 \
@@ -13,9 +13,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         openjdk-17-jre-headless \
         curl \
-        python3.11 \
-        python3.11-venv \
-        python3.11-dev \
+        procps \
     && apt-get autoremove -yqq --purge \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
@@ -28,5 +26,10 @@ RUN curl -O https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/spark-$
     && curl -sL "https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_VERSION}/aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar" -o ${SPARK_HOME}/jars/aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar \
     && chown -R airflow:root /opt/spark-${SPARK_VERSION}-bin-hadoop${HADOOP_VERSION} \
     && chmod -R 755 /opt/spark-${SPARK_VERSION}-bin-hadoop${HADOOP_VERSION}
+
+ENV PATH="${SPARK_HOME}/bin:${JAVA_HOME}/bin:${PATH}" \
+    PYTHONPATH="${SPARK_HOME}/python:${SPARK_HOME}/python/lib/py4j-0.10.9.7-src.zip:${PYTHONPATH:-}" \
+    PYSPARK_PYTHON="python3" \
+    PYSPARK_DRIVER_PYTHON="python3"
 
 USER airflow

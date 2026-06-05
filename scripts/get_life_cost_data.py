@@ -23,7 +23,6 @@ def fetch_gus_monthly_data():
                 for entry in values:
                     year = entry['year']
                     period_id = int(entry['id'])
-
                     if period_id <= 12:
                         month = period_id
                     elif 21 <= period_id <= 24:

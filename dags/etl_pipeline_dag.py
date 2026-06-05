@@ -6,7 +6,7 @@ from pprint import pformat
 
 
 default_args = {
-    "owner": "Maciej Skorupski",
+    "owner": "Mabuza",
     "depends_on_past": False,
     "email_on_failure": False,
     "email_on_retry": False,
@@ -26,5 +26,4 @@ with DAG(
         task_id="temp_task",
         bash_command="date",
     )
-
     temp_bash

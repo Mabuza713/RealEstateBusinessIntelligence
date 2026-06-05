@@ -128,7 +128,6 @@ if __name__ == "__main__":
         # Bezpieczna pauza przed zmianą miasta na kolejne
         print("Czekam 5 sekund przed kolejnym miastem...")
         time.sleep(5)
-
     print(
         "\nSukces! Wszystkie dane zostały pobrane i połączone w 3 plikach zbiorczych w katalogu '../data_raw/'."
     )

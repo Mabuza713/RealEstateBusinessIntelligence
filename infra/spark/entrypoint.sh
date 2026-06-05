@@ -33,6 +33,7 @@ fi
 echo "Starting Spark Master..."
 $SPARK_HOME/sbin/start-master.sh --host 0.0.0.0 --port 7077 || true
 echo "Starting Spark Worker..."
+echo $(hostname)
 $SPARK_HOME/sbin/start-worker.sh spark://$(hostname):7077 || true
 echo "Starting Spark History Server..."
 $SPARK_HOME/sbin/start-history-server.sh || true

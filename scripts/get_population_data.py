@@ -196,7 +196,6 @@ if __name__ == "__main__":
     parser.add_argument("--rok_do", type=int, default=2025, help="Rok końcowy")
     parser.add_argument("--klucz", type=str, default=None, help="Klucz API GUS (opcjonalny)")
     args = parser.parse_args()
-
     df = pobierz_dane_bi(rok_od=args.rok_od, rok_do=args.rok_do, api_key=args.klucz)
     if not df.empty:
         pd.set_option("display.max_columns", 10)
