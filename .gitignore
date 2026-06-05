@@ -218,6 +218,10 @@ __marimo__/
 
 .idea/
 data/raw/*
+data/clean/*
+data/rejected/*
+data/marts/**
+data/staging/**
 data/procesed/*
 data/val_split/*
 
