@@ -4,7 +4,7 @@ import os
 import re
 
 dataset_handle = "krzysztofjamroz/apartment-prices-in-poland"
-target_dir = "../../data_raw/"
+target_dir = "../data_raw/"
 os.makedirs(target_dir, exist_ok=True)
 
 # Definiujemy ścieżki dla dwóch osobnych plików

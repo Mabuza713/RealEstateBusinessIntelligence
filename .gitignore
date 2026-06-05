@@ -8,7 +8,6 @@ __pycache__/
 
 # Distribution / packaging
 .Python
-build/
 develop-eggs/
 dist/
 downloads/
@@ -218,5 +217,12 @@ __marimo__/
 .streamlit/secrets.toml
 
 .idea/
-data/
-data_raw/
+data/raw/*
+data/procesed/*
+data/val_split/*
+
+
+!val_split
+!processed
+!raw
+!data

@@ -47,7 +47,7 @@ def fetch_gus_monthly_data():
     df_pivot['Date'] = pd.to_datetime(df_pivot['Date'])
     df_pivot = df_pivot.sort_values('Date')
 
-    df_pivot.to_csv("../../data_raw/poland_real_estate_monthly_2023_2024.csv", index=False, sep=";")
+    df_pivot.to_csv("../data/raw/poland_real_estate_monthly_2023_2024.csv", index=False, sep=";")
 
 
 if __name__ == "__main__":

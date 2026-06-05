@@ -28,7 +28,7 @@ def FetchAndAppendPoints(city, point_type, key, filename):
         if len(result.nodes) == 0:
             return
 
-        # Upewniamy się, że katalog docelowy istnieje (np. ../../data_raw/)
+        # Upewniamy się, że katalog docelowy istnieje (np. ../data_raw/)
         if os.path.dirname(filename):
             os.makedirs(os.path.dirname(filename), exist_ok=True)
 
@@ -92,9 +92,9 @@ if __name__ == "__main__":
 
     # Definiujemy ścieżki do trzech zbiorczych plików
     output_files = {
-        "cafe": "../../data_raw/all_cafes.csv",
-        "parking": "../../data_raw/all_parkings.csv",
-        "bus_stop": "../../data_raw/all_bus_stops.csv",
+        "cafe": "../data/raw/all_cafes.csv",
+        "parking": "../data/raw/all_parkings.csv",
+        "bus_stop": "../data/raw/all_bus_stops.csv",
     }
 
     # WAŻNE: Czyścimy stare pliki na początku uruchomienia programu.
@@ -130,5 +130,5 @@ if __name__ == "__main__":
         time.sleep(5)
 
     print(
-        "\nSukces! Wszystkie dane zostały pobrane i połączone w 3 plikach zbiorczych w katalogu '../../data_raw/'."
+        "\nSukces! Wszystkie dane zostały pobrane i połączone w 3 plikach zbiorczych w katalogu '../data_raw/'."
     )

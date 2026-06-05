@@ -1,3 +1,13 @@
 overpy
 kagglehub[pandas-datasets]
 requests
+apache-airflow
+
+pyspark==3.5.1
+pyarrow>=10.0.0
+
+ipykernel
+notebook
+
+pandas
+numpy

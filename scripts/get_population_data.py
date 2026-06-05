@@ -183,7 +183,7 @@ def pobierz_dane_bi(rok_od, rok_do, api_key=None):
     df_final = df_final.sort_values(["Data", "Glowne_Miasto"]).reset_index(drop=True)
 
     # Zmodyfikowana nazwa pliku zawierająca zakres lat
-    nazwa_pliku = f"baza_bi_miasta_{rok_od}_{rok_do}.csv"
+    nazwa_pliku = f"../data/raw/baza_bi_miasta_{rok_od}_{rok_do}.csv"
     df_final.to_csv(nazwa_pliku, index=False, encoding="utf-8-sig")
 
     print(f"Dane zostały pobrane i zapisane w: {nazwa_pliku}")

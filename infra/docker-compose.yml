@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: postgres:12.2-alpine
+    ports:
+      - "5432:5432"
+    env_file:
+      - ../.env
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - shared-network
+
+  spark:
+    build:
+      dockerfile: infra/spark/Spark.Dockerfile
+      context: ..
+    ports:
+      - "4041:4041"
+      - "18080:18080"
+      - "4040:4040"
+      - "7077:7077"
+    env_file:
+      - ../.env
+    volumes:
+      - ../scripts:/home/hostuser/app/apps/scripts
+      - ../data:/home/hostuser/app/apps/data
+    networks:
+      - shared-network
+
+volumes:
+  postgres_data:
+
+networks:
+  shared-network:
+    driver: bridge
