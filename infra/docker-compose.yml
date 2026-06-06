@@ -23,7 +23,7 @@ services:
       - ../.env
     volumes:
       - ../scripts:/home/hostuser/app/apps/scripts
-      - ../data:/home/hostuser/app/apps/data
+      - ../data:/opt/airflow/data
     networks:
       - shared-network
 

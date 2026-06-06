@@ -33,3 +33,4 @@ ENV PATH="${SPARK_HOME}/bin:${JAVA_HOME}/bin:${PATH}" \
     PYSPARK_DRIVER_PYTHON="python3"
 
 USER airflow
+RUN pip install --no-cache-dir overpy "kagglehub[pandas-datasets]"
