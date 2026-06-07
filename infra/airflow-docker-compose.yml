@@ -147,6 +147,8 @@ services:
     environment:
       <<: *airflow-common-env
       DUMB_INIT_SETSID: "0"
+    mem_limit: 5g
+    memswap_limit: 5g
     restart: always
     depends_on:
       <<: *airflow-common-depends-on

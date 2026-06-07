@@ -1,35 +1,40 @@
 """Spark: clean — dodatkowe czyszczenie stg.* wg reguł context.md.
 
-Etap wykonywany PO spark_transform.py (który wstępnie czyści i ładuje dane).
+Etap wykonywany PO spark_transform.py.
 Czyta z stg.* w Postgres, stosuje pozostałe transformacje, nadpisuje stg.*.
 
-Reguły z context.md obsługiwane tutaj:
+Reguły z context.md:
 - Dim_Demografia: odrzucenie wierszy gdzie populacja_k + populacja_m ≠ populacja_ogolna
-- Dim_Infrastruktura: IDW (Inverse Distance Weighting) dla brakujących odległości POI
-- Dim_Budynek/Lokal: imputacja brakującego buildingMaterial/condition z k-NN (50m → 2km)
-- Dim_Czas: deduplicacja na (source_date) — brak luk w datach (ostrzeżenie)
-- Fact: cena_za_m2 nie może być ujemna; powierzchnia 10–300 m²
+- Dim_Infrastruktura: IDW dla brakujących odległości — grid-bucketing zamiast cross-join
+- Dim_Budynek/Lokal: imputacja dominantą per miasto dla buildingMaterial/condition
+- Dim_Czas: ostrzeżenie o lukach w datach
+- Fact: double-check powierzchnia 10–300 m² i price > 0
+
+IDW przez grid-bucketing:
+  Siatka 0.018° (~2km). Każdy wiersz dostaje klucz (grid_lat, grid_lon).
+  Join tylko po kluczu siatki i sąsiednich komórkach → O(n * k) zamiast O(n²).
 """
 
 import os
+from datetime import datetime
 
 from pyspark.sql import SparkSession, Window, functions as F
-from pyspark.sql.types import DecimalType
 
-# odległości do imputacji IDW (Dim_Infrastruktura)
 _DISTANCE_COLS = [
     "schooldistance", "clinicdistance", "postofficedistance",
     "kindergartendistance", "restaurantdistance", "collegedistance",
     "pharmacydistance", "centredistance",
 ]
 
-# cechy budynku do imputacji k-NN z sąsiedztwa
 _BUILDING_COLS = ["buildingmaterial", "condition"]
 
-# max sąsiedzi do IDW
-_IDW_K = 10
-_IDW_RADIUS_DEG = 0.018  # ~2 km w stopniach
+_GRID_SIZE = 0.018   # ~2 km w stopniach
+_IDW_K = 10          # max sąsiedzi do uśrednienia
 
+
+# ---------------------------------------------------------------------------
+# PostgreSQL helpers
+# ---------------------------------------------------------------------------
 
 def _pg_opts(spark, table):
     pg_user = os.environ.get("POSTGRES_USER", "postgres")
@@ -64,172 +69,194 @@ def _write_postgres(df, table, url, user, password):
         .save()
 
 
-# --- Dim_Demografia: weryfikacja sumy populacji --------------------------------
+# ---------------------------------------------------------------------------
+# Dim_Demografia: weryfikacja sumy populacji
+# ---------------------------------------------------------------------------
+
 def _clean_demografia(df):
-    """Odrzuć wiersze gdzie populacja_k + populacja_m ≠ populacja_ogolna (gdy wszystkie ≠ NULL)."""
+    """Odrzuć wiersze gdzie populacja_k + populacja_m ≠ populacja_ogolna."""
     has_all = (
         F.col("populacja_ogolna").isNotNull() &
         F.col("populacja_mezczyzni").isNotNull() &
         F.col("populacja_kobiety").isNotNull()
     )
-    sum_ok = (F.col("populacja_mezczyzni") + F.col("populacja_kobiety")) == F.col("populacja_ogolna")
+    sum_ok = (
+        (F.col("populacja_mezczyzni") + F.col("populacja_kobiety")) == F.col("populacja_ogolna")
+    )
     return df.filter(~has_all | sum_ok)
 
 
-# --- Dim_Infrastruktura: IDW dla brakujących odległości -----------------------
-def _idw_impute(df, col):
-    """Uzupełnij brakujące wartości `col` przez IDW z 10 najbliższych sąsiadów (w ~2km)."""
-    known = df.filter(F.col(col).isNotNull()).select(
-        F.col("latitude").alias("_lat_k"),
-        F.col("longitude").alias("_lon_k"),
-        F.col(col).alias("_val_k"),
-    )
-    missing = df.filter(F.col(col).isNull())
+# ---------------------------------------------------------------------------
+# IDW przez grid-bucketing — O(n * k), brak cross-join
+# ---------------------------------------------------------------------------
 
-    if missing.count() == 0:
+def _add_grid_key(df, size):
+    """Dodaj kolumnę grid_key = (floor(lat/size), floor(lon/size))."""
+    return df.withColumn(
+        "_grid_lat", F.floor(F.col("latitude").cast("double") / size)
+    ).withColumn(
+        "_grid_lon", F.floor(F.col("longitude").cast("double") / size)
+    )
+
+
+def _idw_impute(df, col):
+    """IDW dla kolumny `col` przez grid-bucketing (sąsiedztwo 3×3 komórek)."""
+    lower_cols = [c.lower() for c in df.columns]
+    if col not in lower_cols:
         return df
 
-    # Cross-join z filtrem bounding-box, następnie IDW
+    # Sprawdź, czy są jakieś brakujące wartości. Jeśli nie, pomiń.
+    missing_count = df.filter(F.col(col).isNull()).count()
+    if missing_count == 0:
+        return df
+
+    # Oblicz mediany per miasto z góry na wypadek braku sąsiadów w siatce
+    city_medians = (
+        df.filter(F.col(col).isNotNull())
+        .groupBy("city")
+        .agg(F.percentile_approx(F.col(col).cast("double"), 0.5).alias("_city_median"))
+    )
+
+    # Podziel na znane i brakujące
+    known = (
+        _add_grid_key(df.filter(F.col(col).isNotNull()), _GRID_SIZE)
+        .select(
+            "_grid_lat", "_grid_lon",
+            F.col("latitude").alias("_lat_k"),
+            F.col("longitude").alias("_lon_k"),
+            F.col(col).cast("double").alias("_val_k"),
+        )
+    )
+    missing = _add_grid_key(df.filter(F.col(col).isNull()), _GRID_SIZE)
+
+    # Eksploduj brakujące na 9 kluczy siatki (sąsiedztwo 3×3)
+    offsets = F.array(*[
+        F.struct(F.lit(dy).alias("dy"), F.lit(dx).alias("dx"))
+        for dy in (-1, 0, 1)
+        for dx in (-1, 0, 1)
+    ])
+    missing_exp = (
+        missing
+        .withColumn("_offset", F.explode(offsets))
+        .withColumn("_join_lat", F.col("_grid_lat") + F.col("_offset.dy"))
+        .withColumn("_join_lon", F.col("_grid_lon") + F.col("_offset.dx"))
+        .drop("_offset")
+    )
+
+    # Broadcastuj małą tabelę missing_exp, aby uniknąć shuffle wielkiego known
     joined = (
-        missing.join(known, how="cross")
-        .filter(
-            (F.abs(F.col("latitude") - F.col("_lat_k")) <= _IDW_RADIUS_DEG) &
-            (F.abs(F.col("longitude") - F.col("_lon_k")) <= _IDW_RADIUS_DEG)
+        F.broadcast(missing_exp).alias("m")
+        .join(
+            known,
+            (F.col("m._join_lat") == known["_grid_lat"]) &
+            (F.col("m._join_lon") == known["_grid_lon"]),
+            "left",
         )
         .withColumn(
             "_dist",
             F.sqrt(
-                F.pow(F.col("latitude") - F.col("_lat_k"), 2) +
-                F.pow(F.col("longitude") - F.col("_lon_k"), 2)
+                F.pow(F.col("m.latitude").cast("double") - F.col("_lat_k"), 2) +
+                F.pow(F.col("m.longitude").cast("double") - F.col("_lon_k"), 2)
             ),
         )
-        .filter(F.col("_dist") > 0)
-        .withColumn("_w", F.lit(1.0) / F.col("_dist"))
-        .withColumn("_wz", F.col("_w") * F.col("_val_k"))
+        .filter(F.col("_lat_k").isNotNull() & (F.col("_dist") > 0))
     )
 
+    # IDW: top-k najbliższych → ważona średnia
     w = Window.partitionBy("id", "listing_type")
-    ranked = (
+    agg = (
         joined
-        .withColumn("_rn", F.row_number().over(w.orderBy(F.col("_dist"))))
+        .withColumn("_rn", F.row_number().over(w.orderBy("_dist")))
         .filter(F.col("_rn") <= _IDW_K)
+        .withColumn("_weight", F.lit(1.0) / F.col("_dist"))
+        .groupBy("id", "listing_type")
+        .agg(
+            (F.sum(F.col("_weight") * F.col("_val_k")) / F.sum("_weight"))
+            .alias("_imputed")
+        )
     )
 
-    agg = ranked.groupBy("id", "listing_type").agg(
-        (F.sum("_wz") / F.sum("_w")).alias(f"_imputed_{col}")
-    )
-
+    # Deduplikacja missing po eksplozji, join z wyliczonymi wartościami oraz medianami miast
+    missing_dedup = missing.dropDuplicates(["id", "listing_type"])
     imputed = (
-        missing
-        .join(agg, on=["id", "listing_type"], how="left")
-        .withColumn(col, F.round(F.col(f"_imputed_{col}").cast("double"), 2))
-        .drop(f"_imputed_{col}")
+        F.broadcast(missing_dedup).alias("md")
+        .join(F.broadcast(agg).alias("a"), on=["id", "listing_type"], how="left")
+        .join(F.broadcast(city_medians).alias("cm"), on="city", how="left")
+        .withColumn(
+            col,
+            F.when(F.col("a._imputed").isNotNull(), F.round(F.col("a._imputed"), 2))
+            .otherwise(F.col("cm._city_median"))
+        )
+        .drop("_imputed", "_city_median", "_grid_lat", "_grid_lon", "_join_lat", "_join_lon")
     )
 
-    return df.filter(F.col(col).isNotNull()).union(imputed)
-
-
-# --- Dim_Budynek/Lokal: imputacja cech budynku z sąsiedztwa ------------------
-def _impute_building_attr(df, col):
-    """Uzupełnij NULL w `col` dominantą z sąsiedztwa (50m pierwsze, do 2km fallback)."""
-    known = df.filter(
-        F.col(col).isNotNull() &
-        (F.trim(F.col(col)) != "brak informacji")
-    ).select("latitude", "longitude", F.col(col).alias("_val"))
-
-    missing = df.filter(
-        F.col(col).isNull() | (F.trim(F.col(col)) == "brak informacji")
+    return (
+        df.filter(F.col(col).isNotNull())
+        .union(imputed.select(df.columns))
     )
 
-    if missing.count() == 0:
-        return df
 
-    for radius in (0.00045, _IDW_RADIUS_DEG):  # ~50m, ~2km
-        joined = (
-            missing.join(known, how="cross")
+
+# ---------------------------------------------------------------------------
+# Dim_Budynek/Lokal: dominanta per miasto (bez cross-join)
+# ---------------------------------------------------------------------------
+
+def _impute_building_attrs(df, cols):
+    """Uzupełnij NULL/'brak informacji' dominantą z tego samego miasta."""
+    for col in cols:
+        if col not in [c.lower() for c in df.columns]:
+            continue
+
+        is_missing = F.col(col).isNull() | (F.trim(F.col(col)) == "brak informacji")
+
+        city_mode = (
+            df.filter(~is_missing)
+            .groupBy("city", col)
+            .count()
             .withColumn(
-                "_dist",
-                F.sqrt(
-                    F.pow(F.col("latitude") - F.col("longitude_1").alias("lon"), 2) +
-                    F.pow(F.col("latitude") - F.col("latitude"), 2)
+                "_rn",
+                F.row_number().over(
+                    Window.partitionBy("city").orderBy(F.col("count").desc())
                 ),
             )
-        )
-        # uproszczone: bounding box
-        joined = (
-            missing.alias("m")
-            .join(known.alias("k"), how="cross")
-            .filter(
-                (F.abs(F.col("m.latitude") - F.col("k.latitude")) <= radius) &
-                (F.abs(F.col("m.longitude") - F.col("k.longitude")) <= radius)
-            )
-            .withColumn(
-                "_dist",
-                F.sqrt(
-                    F.pow(F.col("m.latitude") - F.col("k.latitude"), 2) +
-                    F.pow(F.col("m.longitude") - F.col("k.longitude"), 2)
-                ),
-            )
-        )
-
-        w = Window.partitionBy("m.id", "m.listing_type")
-        ranked = (
-            joined
-            .withColumn("_rn", F.row_number().over(w.orderBy("_dist")))
-            .filter(F.col("_rn") <= _IDW_K)
-        )
-
-        # dominanta (mode) — najczęstsza wartość w okolicy
-        mode_agg = ranked.groupBy("m.id", "m.listing_type", "_val").count()
-        w2 = Window.partitionBy("m.id", "m.listing_type")
-        mode_df = (
-            mode_agg
-            .withColumn("_mode_rn", F.row_number().over(w2.orderBy(F.col("count").desc())))
-            .filter(F.col("_mode_rn") == 1)
+            .filter(F.col("_rn") == 1)
             .select(
-                F.col("m.id").alias("_id"),
-                F.col("m.listing_type").alias("_lt"),
-                F.col("_val").alias(f"_imputed_{col}"),
+                F.col("city").alias("_city_m"),
+                F.col(col).alias(f"_mode_{col}"),
             )
         )
 
-        imputed = (
-            missing
-            .join(mode_df, (missing["id"] == F.col("_id")) & (missing["listing_type"] == F.col("_lt")), "left")
-            .withColumn(col, F.coalesce(F.col(f"_imputed_{col}"), F.col(col)))
-            .drop("_id", "_lt", f"_imputed_{col}")
+        df = (
+            df.join(city_mode, df["city"] == city_mode["_city_m"], "left")
+            .withColumn(col, F.when(is_missing, F.col(f"_mode_{col}")).otherwise(F.col(col)))
+            .drop("_city_m", f"_mode_{col}")
         )
 
-        still_missing = imputed.filter(F.col(col).isNull() | (F.trim(F.col(col)) == "brak informacji"))
-        resolved = imputed.filter(F.col(col).isNotNull() & (F.trim(F.col(col)) != "brak informacji"))
-
-        if still_missing.count() == 0:
-            return df.filter(
-                F.col(col).isNotNull() & (F.trim(F.col(col)) != "brak informacji")
-            ).union(resolved)
-
-        missing = still_missing
-
-    # Fallback: zostaw "brak informacji"
-    return df.filter(
-        F.col(col).isNotNull() & (F.trim(F.col(col)) != "brak informacji")
-    ).union(missing)
+    return df
 
 
-# --- Dim_Czas: ostrzeżenie o lukach w datach ----------------------------------
-def _warn_date_gaps(df, spark):
-    dates = df.select("source_date").distinct().orderBy("source_date").collect()
-    from datetime import datetime, timedelta
+# ---------------------------------------------------------------------------
+# Dim_Czas: ostrzeżenie o lukach w datach
+# ---------------------------------------------------------------------------
+
+def _warn_date_gaps(df):
+    rows = df.select("source_date").distinct().orderBy("source_date").collect()
     parsed = sorted(
-        {datetime.strptime(str(r["source_date"])[:7], "%Y-%m") for r in dates if r["source_date"]}
+        {datetime.strptime(str(r["source_date"])[:7], "%Y-%m") for r in rows if r["source_date"]}
     )
     for i in range(1, len(parsed)):
-        gap = (parsed[i].year * 12 + parsed[i].month) - (parsed[i - 1].year * 12 + parsed[i - 1].month)
+        gap = (
+            (parsed[i].year * 12 + parsed[i].month) -
+            (parsed[i - 1].year * 12 + parsed[i - 1].month)
+        )
         if gap > 1:
             print(f"[WARN] Luka w datach Dim_Czas: {parsed[i-1]:%Y-%m} → {parsed[i]:%Y-%m}")
 
 
-# --- main --------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
 def main():
     spark = (
         SparkSession.builder.appName("ETL_Clean")
@@ -242,21 +269,23 @@ def main():
     # --- demografia ---
     df_demo, url, user, pwd = _pg_opts(spark, "demografia")
     df_demo = _clean_demografia(df_demo)
+    df_demo = df_demo.localCheckpoint()
     _write_postgres(df_demo, "demografia", url, user, pwd)
     print(f"Clean OK: stg.demografia ({df_demo.count()} wierszy)")
 
-    # --- apartments: IDW dla odległości + imputacja cech budynku ---
+    # --- apartments ---
     df_apt, url, user, pwd = _pg_opts(spark, "apartments")
 
+    # IDW per kolumna odległości (grid-bucketing, bez cross-join)
     for col in _DISTANCE_COLS:
-        if col in [c.lower() for c in df_apt.columns]:
-            df_apt = _idw_impute(df_apt, col)
+        df_apt = _idw_impute(df_apt, col)
+        df_apt = df_apt.localCheckpoint()
 
-    for col in _BUILDING_COLS:
-        if col in [c.lower() for c in df_apt.columns]:
-            df_apt = _impute_building_attr(df_apt, col)
+    # Dominanta per miasto dla cech budynku
+    df_apt = _impute_building_attrs(df_apt, _BUILDING_COLS)
+    df_apt = df_apt.localCheckpoint()
 
-    # Fact: cena_za_m2 ≥ 0, powierzchnia 10–300 (double-check po ewentualnych zmianach)
+    # Double-check filtrów jakości
     df_apt = df_apt.filter(
         F.col("squaremeters").cast("double").between(10, 300) &
         (F.col("price").cast("double") > 0)
@@ -265,8 +294,7 @@ def main():
     _write_postgres(df_apt, "apartments", url, user, pwd)
     print(f"Clean OK: stg.apartments ({df_apt.count()} wierszy)")
 
-    # --- Dim_Czas: ostrzeżenie o lukach ---
-    _warn_date_gaps(df_apt, spark)
+    _warn_date_gaps(df_apt)
 
     spark.stop()
 

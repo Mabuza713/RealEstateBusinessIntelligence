@@ -42,6 +42,27 @@ def _read(spark, table):
     )
 
 
+def _truncate_prod_tables(spark):
+    pg_user = os.environ.get("POSTGRES_USER", "postgres")
+    pg_password = os.environ.get("POSTGRES_PASSWORD", "postgres")
+    pg_db = os.environ.get("POSTGRES_DB", "postgres")
+    pg_host = os.environ.get("POSTGRES_HOST", "postgres")
+    pg_port = os.environ.get("POSTGRES_PORT", "5432")
+    url = f"jdbc:postgresql://{pg_host}:{pg_port}/{pg_db}"
+
+    jvm = spark.sparkContext._gateway.jvm
+    jvm.java.lang.Class.forName("org.postgresql.Driver")
+    conn = jvm.java.sql.DriverManager.getConnection(url, pg_user, pg_password)
+    try:
+        stmt = conn.createStatement()
+        # Truncate all tables cascade to reset IDs and clear tables without violating foreign key constraints
+        stmt.execute("TRUNCATE TABLE prod.Fact_Oferta_Nieruchomosci, prod.Dim_Czas, prod.Dim_Lokal, prod.Dim_Budynek, prod.Dim_Infrastruktura, prod.Dim_Demografia CASCADE;")
+        stmt.close()
+        print("TRUNCATE prod.* CASCADE OK")
+    finally:
+        conn.close()
+
+
 def _write(df, table):
     opts = _pg_opts()
     df.write \
@@ -51,8 +72,7 @@ def _write(df, table):
         .option("user",     opts["user"]) \
         .option("password", opts["password"]) \
         .option("driver",   opts["driver"]) \
-        .option("truncate", "true") \
-        .mode("overwrite") \
+        .mode("append") \
         .save()
 
 
@@ -91,12 +111,12 @@ def _load_dim_lokal(apt):
     df = _add_sk(
         apt.select(
             F.col("id").alias("source_id"),
-            "listing_type", "latitude", "longitude", "city",
+            "listing_type", "source_date", "latitude", "longitude", "city",
             F.col("squaremeters").alias("squareMeters"),
             "rooms", "floor",
             F.col("floorcount").alias("floorCount"),
             "condition", "haselevator", "hasparkingspace",
-            "hasstorage", "hassecurity", "hasbalcony", "price", "ownership",
+            "hasstorageroom", "hassecurity", "hasbalcony", "price", "ownership",
         ),
         "ID_Lokalu",
     )
@@ -107,7 +127,7 @@ def _load_dim_lokal(apt):
             "rooms", "floor", "floorCount", "condition",
             F.col("haselevator").alias("hasElevator"),
             F.col("hasparkingspace").alias("hasParkingSpace"),
-            F.col("hasstorage").alias("hasStorageRoom"),
+            F.col("hasstorageroom").alias("hasStorageRoom"),
             F.col("hassecurity").alias("hasSecurity"),
             F.col("hasbalcony").alias("hasBalcony"),
             "price", "ownership",
@@ -125,7 +145,7 @@ def _load_dim_budynek(apt):
     df = _add_sk(
         apt.select(
             F.col("id").alias("source_id"),
-            "listing_type", "city", "type",
+            "listing_type", "source_date", "city", "type",
             F.col("buildyear").alias("buildYear"),
             F.col("buildingmaterial").alias("buildingMaterial"),
         ),
@@ -150,7 +170,7 @@ def _load_dim_infrastruktura(apt):
     # kolumny opcjonalne (mogą nie istnieć jeśli nie zostały wyliczone przez clean)
     available = [c for c in dist_cols if c in [x.lower() for x in apt.columns]]
 
-    sel = [F.col("id").alias("source_id"), "listing_type"]
+    sel = [F.col("id").alias("source_id"), "listing_type", "source_date"]
     renames = {
         "centredistance": "centreDistance", "schooldistance": "schoolDistance",
         "clinicdistance": "clinicDistance", "postofficedistance": "postOfficeDistance",
@@ -169,7 +189,8 @@ def _load_dim_infrastruktura(apt):
             sel.append(F.lit(None).cast(DecimalType(10, 2)).alias(extra))
 
     df = _add_sk(apt.select(*sel), "ID_Infrastruktury")
-    _write(df, "Dim_Infrastruktura")
+    db_cols = [c for c in df.columns if c != "source_date"]
+    _write(df.select(*db_cols), "Dim_Infrastruktura")
     print(f"Load OK: prod.Dim_Infrastruktura ({df.count()} wierszy)")
     return df
 
@@ -204,42 +225,52 @@ def _load_fact(apt, dim_lokal, dim_budynek, dim_infra, dim_czas, dim_demo):
     def _norm(col):
         return translate(lower(trim(col)), "ąćęłńóśźż", "acelnoszz")
 
-    apt_city_norm = apt.withColumn("_city_norm", _norm(F.col("city")))
+    apt_city_norm = (
+        apt.withColumn("_city_norm", _norm(F.col("city")))
+        .withColumn("_year", F.year(F.to_date(F.col("source_date"), "yyyy-MM-dd")))
+    )
 
-    # surrogate key lookup — mapujemy source_id+listing_type na SK
+    # surrogate key lookup — mapujemy source_id+listing_type+source_date na SK
     lokal_map = dim_lokal.select(
-        F.col("source_id").alias("_sid"), F.col("listing_type").alias("_lt"), "ID_Lokalu"
+        F.col("source_id").alias("_sid"),
+        F.col("listing_type").alias("_lt"),
+        F.col("source_date").alias("_sd"),
+        "ID_Lokalu"
     )
     bud_map = dim_budynek.select(
-        F.col("source_id").alias("_sid"), F.col("listing_type").alias("_lt"), "ID_Budynku"
+        F.col("source_id").alias("_sid"),
+        F.col("listing_type").alias("_lt"),
+        F.col("source_date").alias("_sd"),
+        "ID_Budynku"
     )
     infra_map = dim_infra.select(
-        F.col("source_id").alias("_sid"), F.col("listing_type").alias("_lt"), "ID_Infrastruktury"
+        F.col("source_id").alias("_sid"),
+        F.col("listing_type").alias("_lt"),
+        F.col("source_date").alias("_sd"),
+        "ID_Infrastruktury"
     )
     czas_map = dim_czas.select(
         F.col("source_date").alias("_sd"), "ID_Czasu"
     )
 
-    # demo: join po znormalizowanym mieście (Glowne_Miasto)
-    demo_map = dim_demo.withColumn(
-        "_city_norm", _norm(F.col("Glowne_Miasto"))
-    ).select("_city_norm", "ID_Demografii", "Przecietne_Wynagrodzenie_Brutto")
+    # demo: join po znormalizowanym mieście (Glowne_Miasto) i roku
+    # Filtrujemy tylko powiaty miejskie (zawierające "m."), aby uniknąć duplikacji z powiatami ziemskimi
+    demo_map = (
+        dim_demo.filter(F.col("Miasto_GUS").like("%m.%"))
+        .withColumn("_city_norm", _norm(F.col("Glowne_Miasto")))
+        .withColumn("_year", F.year(F.to_date(F.col("Data"), "yyyy-MM-dd")))
+        .select("_city_norm", "_year", "ID_Demografii", "Przecietne_Wynagrodzenie_Brutto")
+    )
 
     fact = (
         apt_city_norm
-        .join(lokal_map,  (apt_city_norm["id"] == lokal_map["_sid"]) & (apt_city_norm["listing_type"] == lokal_map["_lt"]),  "left")
-        .join(bud_map,    (apt_city_norm["id"] == bud_map["_sid"])   & (apt_city_norm["listing_type"] == bud_map["_lt"]),    "left")
-        .join(infra_map,  (apt_city_norm["id"] == infra_map["_sid"]) & (apt_city_norm["listing_type"] == infra_map["_lt"]),  "left")
+        .join(lokal_map,  (apt_city_norm["id"] == lokal_map["_sid"]) & (apt_city_norm["listing_type"] == lokal_map["_lt"]) & (apt_city_norm["source_date"] == lokal_map["_sd"]),  "left")
+        .join(bud_map,    (apt_city_norm["id"] == bud_map["_sid"])   & (apt_city_norm["listing_type"] == bud_map["_lt"])   & (apt_city_norm["source_date"] == bud_map["_sd"]),    "left")
+        .join(infra_map,  (apt_city_norm["id"] == infra_map["_sid"]) & (apt_city_norm["listing_type"] == infra_map["_lt"]) & (apt_city_norm["source_date"] == infra_map["_sd"]),  "left")
         .join(czas_map,   apt_city_norm["source_date"] == czas_map["_sd"], "left")
-        .join(demo_map,   apt_city_norm["_city_norm"] == demo_map["_city_norm"], "left")
+        .join(demo_map,   on=["_city_norm", "_year"], how="left")
     )
 
-    # Średnia cena za m² na miasto + liczba pokoi + typ — dla KPI 2 (Deal Index)
-    avg_window = (
-        fact.groupBy("_city_norm", "rooms", "type")
-        .agg(F.avg(F.col("squaremeters").cast("double") and F.col("price").cast("double") /
-                   F.col("squaremeters").cast("double")).alias("_avg_price_per_sqm"))
-    )
     # uproszczone inline (unikamy zależności kołowej):
     fact = fact.withColumn(
         "Cena_Za_M2",
@@ -303,7 +334,8 @@ def main():
         .config("spark.sql.caseSensitive", "false")
         .getOrCreate()
     )
-    spark.sparkContext.setLogLevel("WARN")
+    # Truncate parent and child tables in Postgres to handle foreign key dependencies
+    _truncate_prod_tables(spark)
 
     apt  = _read(spark, "apartments")
     demo = _read(spark, "demografia")

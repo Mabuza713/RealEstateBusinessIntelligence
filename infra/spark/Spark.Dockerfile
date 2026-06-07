@@ -44,10 +44,17 @@ COPY <<EOF ${SPARK_HOME}/conf/spark-defaults.conf
 spark.eventLog.enabled true
 spark.eventLog.dir file://${SPARK_HOME}/event_logs
 spark.history.fs.logDirectory file://${SPARK_HOME}/event_logs
-spark.plugins com.nvidia.spark.SQLPlugin
 spark.sql.execution.arrow.pyspark.enabled true
 spark.pyspark.python /usr/bin/python3.10
 spark.pyspark.driver.python /usr/bin/python3.10
+spark.driver.memory 1536m
+spark.executor.memory 1280m
+spark.driver.cores 2
+spark.executor.cores 2
+spark.driver.maxResultSize 512m
+spark.sql.shuffle.partitions 50
+spark.memory.fraction 0.8
+spark.memory.storageFraction 0.3
 EOF
 
 COPY infra/spark/entrypoint.sh ${SPARK_HOME}/entrypoint.sh
