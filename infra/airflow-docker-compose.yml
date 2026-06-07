@@ -10,6 +10,8 @@ x-airflow-common:
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow/airflow
+    AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_SIZE: 30
+    AIRFLOW__DATABASE__SQL_ALCHEMY_MAX_OVERFLOW: 60
     AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://airflow:airflow@postgres-airflow/airflow
     AIRFLOW__CELERY__BROKER_URL: redis://redis-airflow:6379/0
     AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY}
@@ -36,7 +38,7 @@ x-airflow-common:
     - ../scripts:/opt/airflow/scripts
     - ../data:/opt/airflow/data
 
-  user: "${AIRFLOW_UID:-50000}:0"
+  user: "${AIRFLOW_UID:-1000}:0"
 
   networks:
     - default
@@ -145,6 +147,8 @@ services:
     environment:
       <<: *airflow-common-env
       DUMB_INIT_SETSID: "0"
+    mem_limit: 5g
+    memswap_limit: 5g
     restart: always
     depends_on:
       <<: *airflow-common-depends-on

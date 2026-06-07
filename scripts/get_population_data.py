@@ -8,7 +8,8 @@ from functools import reduce
 
 MIASTA = [
     "Warszawa", "Kraków", "Łódź", "Wrocław", "Poznań",
-    "Gdańsk", "Szczecin", "Bydgoszcz", "Lublin", "Białystok"
+    "Gdańsk", "Szczecin", "Bydgoszcz", "Lublin", "Białystok",
+    "Gdynia", "Katowice", "Radom", "Rzeszów", "Częstochowa"
 ]
 
 POZIOMY_SZUKANIA = [6, 5, 4, 3, 2, 1, 0]

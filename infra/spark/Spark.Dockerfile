@@ -36,6 +36,7 @@ RUN mkdir -p ${SPARK_HOME}/jars ${SPARK_HOME}/logs ${SPARK_HOME}/event_logs \
     && wget -q -O ${SPARK_HOME}/jars/rapids-4-spark_2.12-${RAPIDS_VERSION}.jar "https://repo1.maven.org/maven2/com/nvidia/rapids-4-spark_2.12/${RAPIDS_VERSION}/rapids-4-spark_2.12-${RAPIDS_VERSION}.jar" \
     && wget -q -O ${SPARK_HOME}/jars/hadoop-aws-${HADOOP_JAR_VERSION}.jar "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_JAR_VERSION}/hadoop-aws-${HADOOP_JAR_VERSION}.jar" \
     && wget -q -O ${SPARK_HOME}/jars/aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar "https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_VERSION}/aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar" \
+    && wget -q -O ${SPARK_HOME}/jars/postgresql-42.7.3.jar "https://jdbc.postgresql.org/download/postgresql-42.7.3.jar" \
     && chown -R $USERNAME:$USERNAME ${SPARK_HOME} \
     && chmod -R 0777 ${SPARK_HOME}/event_logs ${SPARK_HOME}/logs
 
@@ -43,10 +44,17 @@ COPY <<EOF ${SPARK_HOME}/conf/spark-defaults.conf
 spark.eventLog.enabled true
 spark.eventLog.dir file://${SPARK_HOME}/event_logs
 spark.history.fs.logDirectory file://${SPARK_HOME}/event_logs
-spark.plugins com.nvidia.spark.SQLPlugin
 spark.sql.execution.arrow.pyspark.enabled true
 spark.pyspark.python /usr/bin/python3.10
 spark.pyspark.driver.python /usr/bin/python3.10
+spark.driver.memory 1536m
+spark.executor.memory 1280m
+spark.driver.cores 2
+spark.executor.cores 2
+spark.driver.maxResultSize 512m
+spark.sql.shuffle.partitions 50
+spark.memory.fraction 0.8
+spark.memory.storageFraction 0.3
 EOF
 
 COPY infra/spark/entrypoint.sh ${SPARK_HOME}/entrypoint.sh

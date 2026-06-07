@@ -7,6 +7,7 @@ services:
       - ../.env
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ../sql:/docker-entrypoint-initdb.d
     networks:
       - shared-network
 
@@ -21,6 +22,12 @@ services:
       - "7077:7077"
     env_file:
       - ../.env
+    environment:
+      SPARK_WORKER_MEMORY: 5g
+      SPARK_WORKER_CORES: 2
+      SPARK_DRIVER_MEMORY: 1.5g
+    mem_limit: 5g
+    memswap_limit: 5g
     volumes:
       - ../scripts:/home/hostuser/app/apps/scripts
       - ../data:/opt/airflow/data
