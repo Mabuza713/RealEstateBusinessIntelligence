@@ -55,41 +55,32 @@ BASE_URL = "https://bdl.stat.gov.pl/api/v1"
 
 
 def make_request(url, headers, max_retries=5):
+    """GET with exponential back-off on 429/503; returns None on any other failure."""
     for attempt in range(max_retries):
         try:
-            r = requests.get(url, headers=headers, timeout=15)
-            if r.status_code == 200:
-                return r
-            elif r.status_code == 429:
-                wait = 2 ** attempt * 2
-                time.sleep(wait)
-            elif r.status_code == 503:
-                wait = 2 ** attempt
-                time.sleep(wait)
-            elif r.status_code == 404:
-                return None
+            response = requests.get(url, headers=headers, timeout=15)
+            if response.status_code == 200:
+                return response
+            if response.status_code == 429:
+                time.sleep(30)
+            elif response.status_code == 503:
+                time.sleep(30)
             else:
                 return None
-        except requests.exceptions.RequestException as e:
+        except requests.exceptions.RequestException:
             time.sleep(3)
     return None
 
 
 def resolve_id_with_fallback(name, primary_id, headers, delay):
     candidates = [primary_id] + FALLBACK_IDS.get(name, [])
-    for cid in candidates:
+    for candidate_id in candidates:
         for level in POZIOMY_SZUKANIA:
-            test_url = f"{BASE_URL}/data/by-variable/{cid}?unit-level={level}&page-size=1&format=json"
-            r = make_request(test_url, headers)
+            test_url = f"{BASE_URL}/data/by-variable/{candidate_id}?unit-level={level}&page-size=1&format=json"
+            response = make_request(test_url, headers)
             time.sleep(delay)
-
-            if r is not None and r.json().get("results"):
-                msg = []
-                if cid != primary_id:
-                    msg.append(f"fallback ID {cid}")
-                if level != POZIOMY_SZUKANIA[0]:
-                    msg.append(f"poziom {level}")
-                return cid, level
+            if response is not None and response.json().get("results"):
+                return candidate_id, level
     return None, None
 
 
@@ -100,11 +91,9 @@ def pobierz_dane_bi(rok_od, rok_do, api_key=None):
     raport = {"ok": [], "skip_404": [], "brak_danych": [], "blad": []}
     wszystkie_ramki = []
 
-    # Budujemy parametry lat dla zapytania (np. year=2023&year=2024&year=2025)
     lata_query = "&".join([f"year={r}" for r in range(rok_od, rok_do + 1)])
 
     for nazwa_kolumny, (zmienna_id, jednostka) in ZMIENNE_BI.items():
-        kolumna_z_jednostka = f"{nazwa_kolumny}"
         aktywne_id, aktywny_poziom = resolve_id_with_fallback(nazwa_kolumny, zmienna_id, headers, delay)
 
         if aktywne_id is None:
@@ -118,13 +107,13 @@ def pobierz_dane_bi(rok_od, rok_do, api_key=None):
         dane_zmiennej = []
 
         while url:
-            r = make_request(url, headers)
-            if r is None:
+            response = make_request(url, headers)
+            if response is None:
                 raport["blad"].append(nazwa_kolumny)
                 break
             time.sleep(delay)
 
-            dane_json = r.json()
+            dane_json = response.json()
             wyniki = dane_json.get("results", [])
 
             for wynik in wyniki:
@@ -132,29 +121,23 @@ def pobierz_dane_bi(rok_od, rok_do, api_key=None):
                 for miasto in MIASTA:
                     if miasto.lower() in nazwa_jednostki.lower():
                         for wartosc in wynik.get("values", []):
-                            # Zabezpieczenie roku w razie braku (choć z API zawsze powinien wrócić)
                             rok_danej = wartosc.get("year", rok_od)
 
-                            miesiac = 12
-                            dzien = 31
-
-                            okres = wartosc.get("period", {})
-                            if okres:
-                                nazwa_okresu = okres.get("name", "").lower()
-                                if "miesiąc" in nazwa_okresu:
-                                    try:
-                                        miesiac = int(nazwa_okresu.replace("miesiąc", "").strip())
-                                        dzien = calendar.monthrange(rok_danej, miesiac)[1]
-                                    except ValueError:
-                                        pass
-
-                            data_kolumna = f"{rok_danej}-{miesiac:02d}-{dzien:02d}"
+                            month, day = 12, 31
+                            period_name = wartosc.get("period", {}).get("name", "").lower()
+                            if "miesiąc" in period_name:
+                                try:
+                                    month = int(period_name.replace("miesiąc", "").strip())
+                                    day = calendar.monthrange(rok_danej, month)[1]
+                                except ValueError:
+                                    pass
+                            data_kolumna = f"{rok_danej}-{month:02d}-{day:02d}"
 
                             dane_zmiennej.append({
                                 "Miasto_GUS": nazwa_jednostki,
                                 "Glowne_Miasto": miasto,
                                 "Data": data_kolumna,
-                                kolumna_z_jednostka: wartosc.get("val"),
+                                nazwa_kolumny: wartosc.get("val"),
                             })
                         break
             url = dane_json.get("links", {}).get("next")

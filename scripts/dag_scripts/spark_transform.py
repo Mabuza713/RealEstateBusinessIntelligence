@@ -1,4 +1,4 @@
-"""Spark: clean → staging (parquet). Bez wymiarów i faktów — tylko przygotowanie danych."""
+"""Spark: clean -> staging (parquet). Bez wymiarow i faktow - tylko przygotowanie danych."""
 
 import os
 from functools import reduce

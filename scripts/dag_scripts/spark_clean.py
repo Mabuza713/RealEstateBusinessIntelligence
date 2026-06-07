@@ -1,20 +1,3 @@
-"""Spark: clean — dodatkowe czyszczenie stg.* wg reguł context.md.
-
-Etap wykonywany PO spark_transform.py.
-Czyta z stg.* w Postgres, stosuje pozostałe transformacje, nadpisuje stg.*.
-
-Reguły z context.md:
-- Dim_Demografia: odrzucenie wierszy gdzie populacja_k + populacja_m ≠ populacja_ogolna
-- Dim_Infrastruktura: IDW dla brakujących odległości — grid-bucketing zamiast cross-join
-- Dim_Budynek/Lokal: imputacja dominantą per miasto dla buildingMaterial/condition
-- Dim_Czas: ostrzeżenie o lukach w datach
-- Fact: double-check powierzchnia 10–300 m² i price > 0
-
-IDW przez grid-bucketing:
-  Siatka 0.018° (~2km). Każdy wiersz dostaje klucz (grid_lat, grid_lon).
-  Join tylko po kluczu siatki i sąsiednich komórkach → O(n * k) zamiast O(n²).
-"""
-
 import os
 from datetime import datetime
 import numpy as np
@@ -31,8 +14,8 @@ _DISTANCE_COLS = [
 
 _BUILDING_COLS = ["buildingmaterial", "condition"]
 
-_GRID_SIZE = 0.018   # ~2 km w stopniach
-_IDW_K = 10          # max sąsiedzi do uśrednienia
+_GRID_SIZE = 0.018   # around 2 km
+_IDW_K = 10          # max neighbors to average
 
 
 # ---------------------------------------------------------------------------
@@ -73,13 +56,13 @@ def _write_postgres(df, table, url, user, password):
 
 
 # ---------------------------------------------------------------------------
-# Dim_Demografia: weryfikacja sumy populacji
+# Dim_Demografia: verify population sum
 # ---------------------------------------------------------------------------
 
 def _clean_demografia(df):
     """
-    Łączy wiersze demograficzne i płacowe dla tego samego głównego miasta i daty,
-    uzupełnia wartości i odrzuca wiersze niespełniające warunków spójności.
+    Merge demographic and wage rows for the same city and date,
+    fill in missing values, and drop rows that fail consistency checks.
     """
     agg_df = df.groupBy("glowne_miasto", "data").agg(
         F.coalesce(
@@ -126,37 +109,37 @@ def _add_grid_key(df, size):
     )
 
 
-def _idw_impute(df, col):
-    """IDW dla kolumny `col` przez grid-bucketing (sąsiedztwo 3×3 komórek)."""
+def _idw_impute(df, distance_col):
+    """IDW imputation for `distance_col` via grid-bucketing (3x3 cell neighborhood)."""
     lower_cols = [c.lower() for c in df.columns]
-    if col not in lower_cols:
+    if distance_col not in lower_cols:
         return df
 
-    # Sprawdź, czy są jakieś brakujące wartości. Jeśli nie, pomiń.
-    missing_count = df.filter(F.col(col).isNull()).count()
+    # Skip if there are no missing values.
+    missing_count = df.filter(F.col(distance_col).isNull()).count()
     if missing_count == 0:
         return df
 
-    # Oblicz mediany per miasto z góry na wypadek braku sąsiadów w siatce
+    # Pre-compute per-city medians as fallback when no grid neighbors exist.
     city_medians = (
-        df.filter(F.col(col).isNotNull())
+        df.filter(F.col(distance_col).isNotNull())
         .groupBy("city")
-        .agg(F.percentile_approx(F.col(col).cast("double"), 0.5).alias("_city_median"))
+        .agg(F.percentile_approx(F.col(distance_col).cast("double"), 0.5).alias("_city_median"))
     )
 
-    # Podziel na znane i brakujące
+    # Split into rows with known values and rows that need imputation.
     known = (
-        _add_grid_key(df.filter(F.col(col).isNotNull()), _GRID_SIZE)
+        _add_grid_key(df.filter(F.col(distance_col).isNotNull()), _GRID_SIZE)
         .select(
             "_grid_lat", "_grid_lon",
             F.col("latitude").alias("_lat_k"),
             F.col("longitude").alias("_lon_k"),
-            F.col(col).cast("double").alias("_val_k"),
+            F.col(distance_col).cast("double").alias("_val_k"),
         )
     )
-    missing = _add_grid_key(df.filter(F.col(col).isNull()), _GRID_SIZE)
+    missing = _add_grid_key(df.filter(F.col(distance_col).isNull()), _GRID_SIZE)
 
-    # Eksploduj brakujące na 9 kluczy siatki (sąsiedztwo 3×3)
+    # Explode missing rows across 9 neighboring grid cells (3x3 neighborhood).
     offsets = F.array(*[
         F.struct(F.lit(dy).alias("dy"), F.lit(dx).alias("dx"))
         for dy in (-1, 0, 1)
@@ -170,7 +153,7 @@ def _idw_impute(df, col):
         .drop("_offset")
     )
 
-    # Broadcastuj małą tabelę missing_exp, aby uniknąć shuffle wielkiego known
+    # Broadcast the smaller missing_exp to avoid shuffling the large known table.
     joined = (
         F.broadcast(missing_exp).alias("m")
         .join(
@@ -189,11 +172,11 @@ def _idw_impute(df, col):
         .filter(F.col("_lat_k").isNotNull() & (F.col("_dist") > 0))
     )
 
-    # IDW: top-k najbliższych → ważona średnia
-    w = Window.partitionBy("id", "listing_type")
+    # IDW: keep top-k nearest neighbors, compute weighted average.
+    row_window = Window.partitionBy("id", "listing_type")
     agg = (
         joined
-        .withColumn("_rn", F.row_number().over(w.orderBy("_dist")))
+        .withColumn("_rn", F.row_number().over(row_window.orderBy("_dist")))
         .filter(F.col("_rn") <= _IDW_K)
         .withColumn("_weight", F.lit(1.0) / F.col("_dist"))
         .groupBy("id", "listing_type")
@@ -203,14 +186,14 @@ def _idw_impute(df, col):
         )
     )
 
-    # Deduplikacja missing po eksplozji, join z wyliczonymi wartościami oraz medianami miast
+    # Deduplicate missing rows (inflated by explode), join imputed values and city medians.
     missing_dedup = missing.dropDuplicates(["id", "listing_type"])
     imputed = (
         F.broadcast(missing_dedup).alias("md")
         .join(F.broadcast(agg).alias("a"), on=["id", "listing_type"], how="left")
         .join(F.broadcast(city_medians).alias("cm"), on="city", how="left")
         .withColumn(
-            col,
+            distance_col,
             F.when(F.col("a._imputed").isNotNull(), F.round(F.col("a._imputed"), 2))
             .otherwise(F.col("cm._city_median"))
         )
@@ -218,7 +201,7 @@ def _idw_impute(df, col):
     )
 
     return (
-        df.filter(F.col(col).isNotNull())
+        df.filter(F.col(distance_col).isNotNull())
         .union(imputed.select(df.columns))
     )
 
@@ -376,6 +359,7 @@ def _impute_spatial_pandas(pdf):
 # ---------------------------------------------------------------------------
 
 def _warn_date_gaps(df):
+    """Print a warning for each missing month in the source_date sequence."""
     rows = df.select("source_date").distinct().orderBy("source_date").collect()
     parsed = sorted(
         {datetime.strptime(str(r["source_date"])[:7], "%Y-%m") for r in rows if r["source_date"]}
@@ -386,7 +370,7 @@ def _warn_date_gaps(df):
             (parsed[i - 1].year * 12 + parsed[i - 1].month)
         )
         if gap > 1:
-            print(f"[WARN] Luka w datach Dim_Czas: {parsed[i-1]:%Y-%m} → {parsed[i]:%Y-%m}")
+            print(f"[WARN] Date gap in Dim_Czas: {parsed[i-1]:%Y-%m} -> {parsed[i]:%Y-%m}")
 
 
 # ---------------------------------------------------------------------------
@@ -412,9 +396,9 @@ def main():
     # --- apartments ---
     df_apt, url, user, pwd = _pg_opts(spark, "apartments")
 
-    # IDW per kolumna odległości (grid-bucketing, bez cross-join)
-    for col in _DISTANCE_COLS:
-        df_apt = _idw_impute(df_apt, col)
+    # IDW per distance column (grid-bucketing, no cross-join)
+    for dist_col in _DISTANCE_COLS:
+        df_apt = _idw_impute(df_apt, dist_col)
         df_apt = df_apt.localCheckpoint()
 
     # Spatial building attributes and amenities imputation via Pandas
@@ -433,7 +417,7 @@ def main():
     df_apt = spark.createDataFrame(pdf_apt[df_apt.columns], schema=df_apt.schema)
     df_apt = df_apt.localCheckpoint()
 
-    # Double-check filtrów jakości
+    # Final quality check
     df_apt = df_apt.filter(
         F.col("squaremeters").cast("double").between(10, 300) &
         (F.col("price").cast("double") > 0)
