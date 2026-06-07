@@ -42,6 +42,19 @@ def _read(spark, table):
     )
 
 
+def _read_prod(spark, table):
+    opts = _pg_opts()
+    return (
+        spark.read.format("jdbc")
+        .option("url", _pg_url())
+        .option("dbtable", f"prod.{table}")
+        .option("user",     opts["user"])
+        .option("password", opts["password"])
+        .option("driver",   opts["driver"])
+        .load()
+    )
+
+
 def _truncate_prod_tables(spark):
     pg_user = os.environ.get("POSTGRES_USER", "postgres")
     pg_password = os.environ.get("POSTGRES_PASSWORD", "postgres")
@@ -234,19 +247,16 @@ def _load_fact(apt, dim_lokal, dim_budynek, dim_infra, dim_czas, dim_demo):
     lokal_map = dim_lokal.select(
         F.col("source_id").alias("_sid"),
         F.col("listing_type").alias("_lt"),
-        F.col("source_date").alias("_sd"),
         "ID_Lokalu"
     )
     bud_map = dim_budynek.select(
         F.col("source_id").alias("_sid"),
         F.col("listing_type").alias("_lt"),
-        F.col("source_date").alias("_sd"),
         "ID_Budynku"
     )
     infra_map = dim_infra.select(
         F.col("source_id").alias("_sid"),
         F.col("listing_type").alias("_lt"),
-        F.col("source_date").alias("_sd"),
         "ID_Infrastruktury"
     )
     czas_map = dim_czas.select(
@@ -264,9 +274,9 @@ def _load_fact(apt, dim_lokal, dim_budynek, dim_infra, dim_czas, dim_demo):
 
     fact = (
         apt_city_norm
-        .join(lokal_map,  (apt_city_norm["id"] == lokal_map["_sid"]) & (apt_city_norm["listing_type"] == lokal_map["_lt"]) & (apt_city_norm["source_date"] == lokal_map["_sd"]),  "left")
-        .join(bud_map,    (apt_city_norm["id"] == bud_map["_sid"])   & (apt_city_norm["listing_type"] == bud_map["_lt"])   & (apt_city_norm["source_date"] == bud_map["_sd"]),    "left")
-        .join(infra_map,  (apt_city_norm["id"] == infra_map["_sid"]) & (apt_city_norm["listing_type"] == infra_map["_lt"]) & (apt_city_norm["source_date"] == infra_map["_sd"]),  "left")
+        .join(lokal_map,  (apt_city_norm["id"] == lokal_map["_sid"]) & (apt_city_norm["listing_type"] == lokal_map["_lt"]),  "left")
+        .join(bud_map,    (apt_city_norm["id"] == bud_map["_sid"])   & (apt_city_norm["listing_type"] == bud_map["_lt"]),    "left")
+        .join(infra_map,  (apt_city_norm["id"] == infra_map["_sid"]) & (apt_city_norm["listing_type"] == infra_map["_lt"]),  "left")
         .join(czas_map,   apt_city_norm["source_date"] == czas_map["_sd"], "left")
         .join(demo_map,   on=["_city_norm", "_year"], how="left")
     )
@@ -341,11 +351,18 @@ def main():
     demo = _read(spark, "demografia")
 
     # Wymiary — kolejność: Czas najpierw (potrzebny do Fact)
-    dim_czas  = _load_dim_czas(spark, apt)
-    dim_lokal = _load_dim_lokal(apt)
-    dim_bud   = _load_dim_budynek(apt)
-    dim_infra = _load_dim_infrastruktura(apt)
-    dim_demo  = _load_dim_demografia(demo)
+    _load_dim_czas(spark, apt)
+    _load_dim_lokal(apt)
+    _load_dim_budynek(apt)
+    _load_dim_infrastruktura(apt)
+    _load_dim_demografia(demo)
+
+    # Read dimensions back from Postgres prod schema to ensure deterministic SKs
+    dim_czas  = _read_prod(spark, "Dim_Czas")
+    dim_lokal = _read_prod(spark, "Dim_Lokal")
+    dim_bud   = _read_prod(spark, "Dim_Budynek")
+    dim_infra = _read_prod(spark, "Dim_Infrastruktura")
+    dim_demo  = _read_prod(spark, "Dim_Demografia")
 
     # Fakt — na końcu, po wszystkich wymiarach
     _load_fact(apt, dim_lokal, dim_bud, dim_infra, dim_czas, dim_demo)

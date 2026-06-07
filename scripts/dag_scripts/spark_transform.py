@@ -117,14 +117,8 @@ def _stage_apartments(spark, src_dir):
             F.col("city").isNotNull() &
             F.col("squareMeters").isNotNull() & (F.col("squareMeters") >= 10) & (F.col("squareMeters") <= 300) &
             F.col("price").isNotNull() & (F.col("price") > 0) &
-            F.col("rooms").isNotNull() &
-            F.col("floor").isNotNull() & (F.col("floor") != -1) &
-            F.col("build_year").isNotNull() &
-            F.col("floorCount").isNotNull() &
-            F.col("poiCount").isNotNull() &
             F.col("latitude").isNotNull() &
             F.col("longitude").isNotNull() &
-            F.col("centre_distance").isNotNull() &
             F.col("source_date").isNotNull()
         )
     )
