@@ -54,3 +54,12 @@ CREATE TABLE IF NOT EXISTS stg.poi (
 );
 
 
+CREATE TABLE IF NOT EXISTS stg.apartments_measures (
+    id VARCHAR(50),
+    listing_type VARCHAR(10),
+    source_date VARCHAR(10),
+    cena_za_m2 NUMERIC(10, 2),
+    odchylenie_procentowe_ceny NUMERIC(8, 4),
+    stosunek_najmu_do_wynagrodzenia NUMERIC(8, 4),
+    premia_lokalizacyjna NUMERIC(10, 2)
+);

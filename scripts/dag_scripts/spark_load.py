@@ -229,7 +229,7 @@ def _load_dim_demografia(demo):
 # ---------------------------------------------------------------------------
 # Fact_Oferta_Nieruchomosci
 # ---------------------------------------------------------------------------
-def _load_fact(apt, dim_lokal, dim_budynek, dim_infra, dim_czas, dim_demo):
+def _load_fact(apt, dim_lokal, dim_budynek, dim_infra, dim_czas, dim_demo, apt_measures):
     # Normalizacja city do joinu z demografią (małe litery, bez polskich znaków)
     # Normalize city name: lowercase, strip, remove Polish diacritics.
     def _norm_city(col):
@@ -272,6 +272,16 @@ def _load_fact(apt, dim_lokal, dim_budynek, dim_infra, dim_czas, dim_demo):
         .select("_city_norm", "_year", "ID_Demografii")
     )
 
+    measures_map = apt_measures.select(
+        F.col("id").alias("_sid"),
+        F.col("listing_type").alias("_lt"),
+        F.col("source_date").alias("_sd"),
+        "cena_za_m2",
+        "odchylenie_procentowe_ceny",
+        "stosunek_najmu_do_wynagrodzenia",
+        "premia_lokalizacyjna"
+    )
+
     fact = (
         apt_city_norm
         .join(lokal_map,  (apt_city_norm["id"] == lokal_map["_sid"]) & (apt_city_norm["listing_type"] == lokal_map["_lt"]) & (apt_city_norm["source_date"] == lokal_map["_sd"]),  "left")
@@ -279,68 +289,17 @@ def _load_fact(apt, dim_lokal, dim_budynek, dim_infra, dim_czas, dim_demo):
         .join(infra_map,  (apt_city_norm["id"] == infra_map["_sid"]) & (apt_city_norm["listing_type"] == infra_map["_lt"]) & (apt_city_norm["source_date"] == infra_map["_sd"]),  "left")
         .join(czas_map,   apt_city_norm["source_date"] == czas_map["_sd"], "left")
         .join(demo_map,   on=["_city_norm", "_year"], how="left")
-    )
-
-    # Compute measures inline (avoids circular dependency):
-    fact = fact.withColumn(
-        "Cena_Za_M2",
-        F.when(F.col("squaremeters").cast("double") > 0,
-               F.col("price").cast("double") / F.col("squaremeters").cast("double"))
-        .otherwise(F.lit(None))
-    )
-
-    # Percentage price deviation - requires avg per (city, rooms, type, listing_type) => self-join.
-    avg_df = fact.groupBy("_city_norm", "rooms", "type", "listing_type").agg(
-        F.avg("Cena_Za_M2").alias("_avg_city_rooms_type")
-    )
-    fact = fact.join(avg_df, on=["_city_norm", "rooms", "type", "listing_type"], how="left")
-
-    fact = fact.withColumn(
-        "Odchylenie_Procentowe_Ceny",
-        F.when(F.col("_avg_city_rooms_type") > 0,
-               (F.col("Cena_Za_M2") - F.col("_avg_city_rooms_type")) / F.col("_avg_city_rooms_type"))
-        .otherwise(F.lit(None))
-    )
-
-    # Rent-to-wage ratio (KPI 4) - rent listings only.
-    fact = fact.withColumn(
-        "Stosunek_Najmu_Do_Wynagrodzenia",
-        F.when(
-            (F.col("listing_type") == "rent") & F.col("Przecietne_Wynagrodzenie_Brutto").isNotNull() &
-            (F.col("Przecietne_Wynagrodzenie_Brutto") > 0),
-            F.col("price").cast("double") / F.col("Przecietne_Wynagrodzenie_Brutto").cast("double")
-        ).otherwise(F.lit(None))
-    )
-
-    # Location premium - computed separately for 'sell' and 'rent' (high POI > 15 vs low).
-    def _calc_premia(df):
-        rows = df.agg(F.avg("Cena_Za_M2").alias("val")).collect()
-        return float(rows[0]["val"] or 0) if rows else 0.0
-
-    sell_fact = fact.filter(F.col("listing_type") == "sell")
-    avg_high_sell = _calc_premia(sell_fact.filter(F.col("poicount") > 15))
-    avg_low_sell  = _calc_premia(sell_fact.filter(F.col("poicount") <= 15))
-    premia_sell   = avg_high_sell - avg_low_sell
-
-    rent_fact = fact.filter(F.col("listing_type") == "rent")
-    avg_high_rent = _calc_premia(rent_fact.filter(F.col("poicount") > 15))
-    avg_low_rent  = _calc_premia(rent_fact.filter(F.col("poicount") <= 15))
-    premia_rent   = avg_high_rent - avg_low_rent
-
-    fact = fact.withColumn(
-        "Premia_Lokalizacyjna",
-        F.when(F.col("listing_type") == "sell", F.lit(round(premia_sell, 2)))
-        .otherwise(F.lit(round(premia_rent, 2)))
+        .join(measures_map, (apt_city_norm["id"] == measures_map["_sid"]) & (apt_city_norm["listing_type"] == measures_map["_lt"]) & (apt_city_norm["source_date"] == measures_map["_sd"]), "left")
     )
 
     result = fact.select(
         "ID_Lokalu", "ID_Budynku", "ID_Infrastruktury", "ID_Czasu", "ID_Demografii",
         F.col("price").cast(DecimalType(15, 2)).alias("Cena_Calkowita"),
-        F.round("Cena_Za_M2", 2).cast(DecimalType(10, 2)).alias("Cena_Za_M2"),
+        F.col("cena_za_m2").cast(DecimalType(10, 2)).alias("Cena_Za_M2"),
         F.col("squaremeters").cast(DecimalType(10, 2)).alias("Powierzchnia_Lokalu"),
-        F.round("Odchylenie_Procentowe_Ceny", 4).cast(DecimalType(8, 4)).alias("Odchylenie_Procentowe_Ceny"),
-        F.round("Stosunek_Najmu_Do_Wynagrodzenia", 4).cast(DecimalType(8, 4)).alias("Stosunek_Najmu_Do_Wynagrodzenia"),
-        F.col("Premia_Lokalizacyjna").cast(DecimalType(10, 2)).alias("Premia_Lokalizacyjna"),
+        F.col("odchylenie_procentowe_ceny").cast(DecimalType(8, 4)).alias("Odchylenie_Procentowe_Ceny"),
+        F.col("stosunek_najmu_do_wynagrodzenia").cast(DecimalType(8, 4)).alias("Stosunek_Najmu_Do_Wynagrodzenia"),
+        F.col("premia_lokalizacyjna").cast(DecimalType(10, 2)).alias("Premia_Lokalizacyjna"),
     ).filter(F.col("ID_Lokalu").isNotNull() & F.col("ID_Budynku").isNotNull() &
              F.col("ID_Infrastruktury").isNotNull() & F.col("ID_Czasu").isNotNull()).cache()
 
@@ -365,6 +324,7 @@ def main():
 
     apt  = _read(spark, "apartments").cache()
     demo = _read(spark, "demografia").cache()
+    apt_measures = _read(spark, "apartments_measures").cache()
 
     # Dimensions - Czas first (required for Fact join).
     dim_czas  = _load_dim_czas(spark, apt)
@@ -374,7 +334,7 @@ def main():
     dim_demo  = _load_dim_demografia(demo)
 
     # Fact - loaded last, after all dimensions.
-    _load_fact(apt, dim_lokal, dim_bud, dim_infra, dim_czas, dim_demo)
+    _load_fact(apt, dim_lokal, dim_bud, dim_infra, dim_czas, dim_demo, apt_measures)
 
     # Clean up cache
     dim_czas.unpersist()
@@ -384,6 +344,7 @@ def main():
     dim_demo.unpersist()
     apt.unpersist()
     demo.unpersist()
+    apt_measures.unpersist()
 
     spark.stop()
 
