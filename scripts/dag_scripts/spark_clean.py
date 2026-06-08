@@ -14,7 +14,6 @@ _DISTANCE_COLS = [
 
 _BUILDING_COLS = ["buildingmaterial", "condition"]
 
-_GRID_SIZE = 0.018   # around 2 km
 _IDW_K = 10          # max neighbors to average
 
 
@@ -100,110 +99,43 @@ def _clean_demografia(df):
 # IDW przez grid-bucketing — O(n * k), brak cross-join
 # ---------------------------------------------------------------------------
 
-def _add_grid_key(df, size):
-    """Dodaj kolumnę grid_key = (floor(lat/size), floor(lon/size))."""
-    return df.withColumn(
-        "_grid_lat", F.floor(F.col("latitude").cast("double") / size)
-    ).withColumn(
-        "_grid_lon", F.floor(F.col("longitude").cast("double") / size)
-    )
-
-
-def _idw_impute(df, distance_col):
-    """IDW imputation for `distance_col` via grid-bucketing (3x3 cell neighborhood)."""
-    lower_cols = [c.lower() for c in df.columns]
-    if distance_col not in lower_cols:
+def _idw_impute(df, col):
+    if col not in df.columns or df.filter(F.col(col).isNull()).count() == 0:
         return df
 
-    # Skip if there are no missing values.
-    missing_count = df.filter(F.col(distance_col).isNull()).count()
-    if missing_count == 0:
-        return df
-
-    # Pre-compute per-city medians as fallback when no grid neighbors exist.
-    city_medians = (
-        df.filter(F.col(distance_col).isNotNull())
-        .groupBy("city")
-        .agg(F.percentile_approx(F.col(distance_col).cast("double"), 0.5).alias("_city_median"))
+    # 1. Podział na rekordy ze znanymi wartościami i szukające wartości
+    known = df.filter(F.col(col).isNotNull()).select(
+        "city",
+        F.col("latitude").alias("_lat_k"),
+        F.col("longitude").alias("_lon_k"),
+        F.col(col).cast("double").alias("_val_k")
     )
+    missing = df.filter(F.col(col).isNull())
 
-    # Split into rows with known values and rows that need imputation.
-    known = (
-        _add_grid_key(df.filter(F.col(distance_col).isNotNull()), _GRID_SIZE)
-        .select(
-            "_grid_lat", "_grid_lon",
-            F.col("latitude").alias("_lat_k"),
-            F.col("longitude").alias("_lon_k"),
-            F.col(distance_col).cast("double").alias("_val_k"),
-        )
-    )
-    missing = _add_grid_key(df.filter(F.col(distance_col).isNull()), _GRID_SIZE)
+    # 2. Złączenie po mieście i obliczenie odległości
+    joined = missing.join(known, "city", "left") \
+        .withColumn("_dist", F.sqrt(F.pow(F.col("latitude").cast("double") - F.col("_lat_k"), 2) + 
+                                    F.pow(F.col("longitude").cast("double") - F.col("_lon_k"), 2))) \
+        .filter(F.col("_val_k").isNotNull() & (F.col("_dist") > 0))
 
-    # Explode missing rows across 9 neighboring grid cells (3x3 neighborhood).
-    offsets = F.array(*[
-        F.struct(F.lit(dy).alias("dy"), F.lit(dx).alias("dx"))
-        for dy in (-1, 0, 1)
-        for dx in (-1, 0, 1)
-    ])
-    missing_exp = (
-        missing
-        .withColumn("_offset", F.explode(offsets))
-        .withColumn("_join_lat", F.col("_grid_lat") + F.col("_offset.dy"))
-        .withColumn("_join_lon", F.col("_grid_lon") + F.col("_offset.dx"))
-        .drop("_offset")
-    )
+    # 3. Obliczenie IDW (średnia ważona odwrotnością odległości dla 10 najbliższych sąsiadów w mieście)
+    win = Window.partitionBy("id", "listing_type").orderBy("_dist")
+    agg = joined.withColumn("_rn", F.row_number().over(win)) \
+                .filter(F.col("_rn") <= _IDW_K) \
+                .withColumn("_w", F.lit(1.0) / F.col("_dist")) \
+                .groupBy("id", "listing_type") \
+                .agg((F.sum(F.col("_w") * F.col("_val_k")) / F.sum("_w")).alias("_imp"))
 
-    # Broadcast the smaller missing_exp to avoid shuffling the large known table.
-    joined = (
-        F.broadcast(missing_exp).alias("m")
-        .join(
-            known,
-            (F.col("m._join_lat") == known["_grid_lat"]) &
-            (F.col("m._join_lon") == known["_grid_lon"]),
-            "left",
-        )
-        .withColumn(
-            "_dist",
-            F.sqrt(
-                F.pow(F.col("m.latitude").cast("double") - F.col("_lat_k"), 2) +
-                F.pow(F.col("m.longitude").cast("double") - F.col("_lon_k"), 2)
-            ),
-        )
-        .filter(F.col("_lat_k").isNotNull() & (F.col("_dist") > 0))
-    )
+    # 4. Uzupełnienie wartości (imputacja lub fallback do mediany miasta)
+    medians = df.filter(F.col(col).isNotNull()).groupBy("city") \
+                .agg(F.percentile_approx(F.col(col).cast("double"), 0.5).alias("_med"))
 
-    # IDW: keep top-k nearest neighbors, compute weighted average.
-    row_window = Window.partitionBy("id", "listing_type")
-    agg = (
-        joined
-        .withColumn("_rn", F.row_number().over(row_window.orderBy("_dist")))
-        .filter(F.col("_rn") <= _IDW_K)
-        .withColumn("_weight", F.lit(1.0) / F.col("_dist"))
-        .groupBy("id", "listing_type")
-        .agg(
-            (F.sum(F.col("_weight") * F.col("_val_k")) / F.sum("_weight"))
-            .alias("_imputed")
-        )
-    )
+    imputed = missing.join(agg, ["id", "listing_type"], "left") \
+                     .join(medians, "city", "left") \
+                     .withColumn(col, F.coalesce(F.round(F.col("_imp"), 2), F.col("_med"))) \
+                     .select(df.columns)
 
-    # Deduplicate missing rows (inflated by explode), join imputed values and city medians.
-    missing_dedup = missing.dropDuplicates(["id", "listing_type"])
-    imputed = (
-        F.broadcast(missing_dedup).alias("md")
-        .join(F.broadcast(agg).alias("a"), on=["id", "listing_type"], how="left")
-        .join(F.broadcast(city_medians).alias("cm"), on="city", how="left")
-        .withColumn(
-            distance_col,
-            F.when(F.col("a._imputed").isNotNull(), F.round(F.col("a._imputed"), 2))
-            .otherwise(F.col("cm._city_median"))
-        )
-        .drop("_imputed", "_city_median", "_grid_lat", "_grid_lon", "_join_lat", "_join_lon")
-    )
-
-    return (
-        df.filter(F.col(distance_col).isNotNull())
-        .union(imputed.select(df.columns))
-    )
+    return df.filter(F.col(col).isNotNull()).union(imputed)
 
 
 

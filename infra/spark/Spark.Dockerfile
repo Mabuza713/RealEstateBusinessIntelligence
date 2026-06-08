@@ -32,7 +32,7 @@ RUN groupadd --gid $USER_GID $USERNAME \
 
 RUN mkdir -p ${SPARK_HOME}/jars ${SPARK_HOME}/logs ${SPARK_HOME}/event_logs \
     && wget -qO- "https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop${HADOOP_VERSION}.tgz" \
-       | tar -xz -C ${SPARK_HOME} --strip-components=1 \
+    | tar -xz -C ${SPARK_HOME} --strip-components=1 \
     && wget -q -O ${SPARK_HOME}/jars/rapids-4-spark_2.12-${RAPIDS_VERSION}.jar "https://repo1.maven.org/maven2/com/nvidia/rapids-4-spark_2.12/${RAPIDS_VERSION}/rapids-4-spark_2.12-${RAPIDS_VERSION}.jar" \
     && wget -q -O ${SPARK_HOME}/jars/hadoop-aws-${HADOOP_JAR_VERSION}.jar "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_JAR_VERSION}/hadoop-aws-${HADOOP_JAR_VERSION}.jar" \
     && wget -q -O ${SPARK_HOME}/jars/aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar "https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_VERSION}/aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar" \
@@ -47,12 +47,12 @@ spark.history.fs.logDirectory file://${SPARK_HOME}/event_logs
 spark.sql.execution.arrow.pyspark.enabled true
 spark.pyspark.python /usr/bin/python3.10
 spark.pyspark.driver.python /usr/bin/python3.10
-spark.driver.memory 1536m
-spark.executor.memory 1280m
-spark.driver.cores 2
-spark.executor.cores 2
+spark.driver.memory 4096m
+spark.executor.memory 4096m
+spark.driver.cores 4
+spark.executor.cores 4
 spark.driver.maxResultSize 512m
-spark.sql.shuffle.partitions 50
+spark.sql.shuffle.partitions 200
 spark.memory.fraction 0.8
 spark.memory.storageFraction 0.3
 EOF

@@ -1,4 +1,4 @@
-"""Ekstrakcja: uruchom skrypt, waliduj, zapisz clean/rejected."""
+"""Ekstrakcja: uruchom skrypt i waliduj."""
 
 import subprocess
 from pathlib import Path
@@ -54,7 +54,7 @@ def _glob(pattern: str) -> list[Path]:
     return sorted(_ROOT.glob(pattern)) if "*" in pattern else [_ROOT / pattern]
 
 
-def _split(df: pd.DataFrame, req: list[str], date_col: str | None, keys: list[str] | None, validators: list | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _split(df: pd.DataFrame, req: list[str], date_col: str | None, keys: list[str] | None, validators: list | None = None) -> pd.DataFrame:
     empty = lambda s: s.isna() | (s.astype(str).str.strip() == "")
     reasons = pd.Series("", index=df.index, dtype="object")
     for col in req:
@@ -68,15 +68,12 @@ def _split(df: pd.DataFrame, req: list[str], date_col: str | None, keys: list[st
         if col in df.columns:
             reasons = reasons.where(fn(df[col]), reasons + f"{reason};")
     bad = reasons.str.strip() != ""
-    good, rejected = df[~bad].copy(), df[bad].copy()
-    if not rejected.empty:
-        rejected["_rejection_reason"] = reasons[bad].str.strip(";")
-    return good, rejected
+    return df[~bad].copy()
 
 
-def run_extract(source_id: str) -> tuple[int, int]:
+def run_extract(source_id: str) -> int:
     script, args, sep, patterns, req, date_col, keys, validators = _SOURCES[source_id]
-    errors, warnings, rows_ok, rows_bad = [], [], 0, 0
+    errors, rows_ok = [], 0
 
     files_exist = all(
         any(p.exists() and p.stat().st_size > 0 for p in _glob(pattern))
@@ -91,7 +88,6 @@ def run_extract(source_id: str) -> tuple[int, int]:
         except subprocess.CalledProcessError as exc:
             raise ExtractionError(f"[{source_id}] {exc}") from exc
 
-    reject_dir = _DATA / "rejected"
     frames = [
         (path, pd.read_csv(path, sep=sep, encoding="utf-8-sig"))
         for pattern in patterns
@@ -110,21 +106,14 @@ def run_extract(source_id: str) -> tuple[int, int]:
             errors.append(f"{path.name}: pusty plik")
             continue
 
-        good, bad = _split(df, req, date_col, keys, validators)
-        reject_dir.mkdir(parents=True, exist_ok=True)
+        good = _split(df, req, date_col, keys, validators)
 
         if not good.empty:
             rows_ok += len(good)
-        if not bad.empty:
-            bad.to_csv(reject_dir / path.name, index=False, encoding="utf-8-sig", sep=sep)
-            rows_bad += len(bad)
-            warnings.append(f"{path.name}: {len(bad)} odrzuconych")
-        if good.empty:
-            errors.append(f"{path.name}: wszystkie wiersze odrzucone")
+        else:
+            errors.append(f"{path.name}: wszystkie wiersze niepoprawne")
 
     if errors:
         raise ExtractionError(f"[{source_id}] " + "; ".join(errors))
-    if warnings:
-        print(f"[WARN] [{source_id}] " + "; ".join(warnings))
 
-    return rows_ok, rows_bad
+    return rows_ok

@@ -53,3 +53,4 @@ CREATE TABLE IF NOT EXISTS stg.poi (
     poi_type VARCHAR(50)
 );
 
+

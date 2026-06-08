@@ -13,12 +13,11 @@ from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.types import DecimalType, IntegerType
 
 
-# ---------------------------------------------------------------------------
 def _pg_url():
     host = os.environ.get("POSTGRES_HOST", "postgres")
     port = os.environ.get("POSTGRES_PORT", "5432")
     db   = os.environ.get("POSTGRES_DB",   "postgres")
-    return f"jdbc:postgresql://{host}:{port}/{db}"
+    return f"jdbc:postgresql://{host}:{port}/{db}?reWriteBatchedInserts=true"
 
 
 def _pg_opts():
@@ -82,13 +81,14 @@ def _write(df, table):
         .option("user",     opts["user"]) \
         .option("password", opts["password"]) \
         .option("driver",   opts["driver"]) \
+        .option("batchsize", "20000") \
         .mode("append") \
         .save()
 
 
 def _add_sk(df, col_name):
     """Add a 1-based surrogate key column using monotonically_increasing_id."""
-    return df.withColumn(col_name, F.monotonically_increasing_id() + 1)
+    return df.coalesce(1).withColumn(col_name, F.monotonically_increasing_id() + 1)
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +107,7 @@ def _load_dim_czas(spark, apt):
             "miesiac", "rok", "source_date_m", "source_date_y",
         )
     )
-    df = _add_sk(df, "ID_Czasu")
+    df = _add_sk(df, "ID_Czasu").cache()
     _write(df.select("ID_Czasu", "source_date", "miesiac", "rok", "source_date_m", "source_date_y"),
            "Dim_Czas")
     print(f"Load OK: prod.Dim_Czas ({df.count()} wierszy)")
@@ -129,7 +129,7 @@ def _load_dim_lokal(apt):
             "hasstorageroom", "hassecurity", "hasbalcony", "price", "ownership",
         ),
         "ID_Lokalu",
-    )
+    ).cache()
     _write(
         df.select(
             "ID_Lokalu", "source_id", "listing_type",
@@ -160,7 +160,7 @@ def _load_dim_budynek(apt):
             F.col("buildingmaterial").alias("buildingMaterial"),
         ),
         "ID_Budynku",
-    )
+    ).cache()
     _write(df.select("ID_Budynku", "source_id", "listing_type",
                      "city", "type", "buildYear", "buildingMaterial"),
            "Dim_Budynek")
@@ -198,7 +198,7 @@ def _load_dim_infrastruktura(apt):
         else:
             sel.append(F.lit(None).cast(DecimalType(10, 2)).alias(extra))
 
-    df = _add_sk(apt.select(*sel), "ID_Infrastruktury")
+    df = _add_sk(apt.select(*sel), "ID_Infrastruktury").cache()
     db_cols = [c for c in df.columns if c != "source_date"]
     _write(df.select(*db_cols), "Dim_Infrastruktura")
     print(f"Load OK: prod.Dim_Infrastruktura ({df.count()} wierszy)")
@@ -220,7 +220,7 @@ def _load_dim_demografia(demo):
             F.col("dochody_wlasne_jst").alias("Dochody_Wlasne_JST"),
         ),
         "ID_Demografii",
-    )
+    ).cache()
     _write(df, "Dim_Demografia")
     print(f"Load OK: prod.Dim_Demografii ({df.count()} wierszy)")
     return df
@@ -240,20 +240,23 @@ def _load_fact(apt, dim_lokal, dim_budynek, dim_infra, dim_czas, dim_demo):
         .withColumn("_year", F.year(F.to_date(F.col("source_date"), "yyyy-MM-dd")))
     )
 
-    # Map source_id + listing_type to surrogate keys from each dimension table.
+    # Map source_id + listing_type + source_date to surrogate keys from each dimension table.
     lokal_map = dim_lokal.select(
         F.col("source_id").alias("_sid"),
         F.col("listing_type").alias("_lt"),
+        F.col("source_date").alias("_sd"),
         "ID_Lokalu"
     )
     bud_map = dim_budynek.select(
         F.col("source_id").alias("_sid"),
         F.col("listing_type").alias("_lt"),
+        F.col("source_date").alias("_sd"),
         "ID_Budynku"
     )
     infra_map = dim_infra.select(
         F.col("source_id").alias("_sid"),
         F.col("listing_type").alias("_lt"),
+        F.col("source_date").alias("_sd"),
         "ID_Infrastruktury"
     )
     czas_map = dim_czas.select(
@@ -266,14 +269,14 @@ def _load_fact(apt, dim_lokal, dim_budynek, dim_infra, dim_czas, dim_demo):
         dim_demo.filter(F.col("Miasto_GUS").like("%m.%"))
         .withColumn("_city_norm", _norm_city(F.col("Glowne_Miasto")))
         .withColumn("_year", F.year(F.to_date(F.col("Data"), "yyyy-MM-dd")))
-        .select("_city_norm", "_year", "ID_Demografii", "Przecietne_Wynagrodzenie_Brutto")
+        .select("_city_norm", "_year", "ID_Demografii")
     )
 
     fact = (
         apt_city_norm
-        .join(lokal_map,  (apt_city_norm["id"] == lokal_map["_sid"]) & (apt_city_norm["listing_type"] == lokal_map["_lt"]),  "left")
-        .join(bud_map,    (apt_city_norm["id"] == bud_map["_sid"])   & (apt_city_norm["listing_type"] == bud_map["_lt"]),    "left")
-        .join(infra_map,  (apt_city_norm["id"] == infra_map["_sid"]) & (apt_city_norm["listing_type"] == infra_map["_lt"]),  "left")
+        .join(lokal_map,  (apt_city_norm["id"] == lokal_map["_sid"]) & (apt_city_norm["listing_type"] == lokal_map["_lt"]) & (apt_city_norm["source_date"] == lokal_map["_sd"]),  "left")
+        .join(bud_map,    (apt_city_norm["id"] == bud_map["_sid"])   & (apt_city_norm["listing_type"] == bud_map["_lt"]) & (apt_city_norm["source_date"] == bud_map["_sd"]),    "left")
+        .join(infra_map,  (apt_city_norm["id"] == infra_map["_sid"]) & (apt_city_norm["listing_type"] == infra_map["_lt"]) & (apt_city_norm["source_date"] == infra_map["_sd"]),  "left")
         .join(czas_map,   apt_city_norm["source_date"] == czas_map["_sd"], "left")
         .join(demo_map,   on=["_city_norm", "_year"], how="left")
     )
@@ -339,10 +342,11 @@ def _load_fact(apt, dim_lokal, dim_budynek, dim_infra, dim_czas, dim_demo):
         F.round("Stosunek_Najmu_Do_Wynagrodzenia", 4).cast(DecimalType(8, 4)).alias("Stosunek_Najmu_Do_Wynagrodzenia"),
         F.col("Premia_Lokalizacyjna").cast(DecimalType(10, 2)).alias("Premia_Lokalizacyjna"),
     ).filter(F.col("ID_Lokalu").isNotNull() & F.col("ID_Budynku").isNotNull() &
-             F.col("ID_Infrastruktury").isNotNull() & F.col("ID_Czasu").isNotNull())
+             F.col("ID_Infrastruktury").isNotNull() & F.col("ID_Czasu").isNotNull()).cache()
 
     _write(result, "Fact_Oferta_Nieruchomosci")
     print(f"Load OK: prod.Fact_Oferta_Nieruchomosci ({result.count()} wierszy)")
+    result.unpersist()
 
 
 # ---------------------------------------------------------------------------
@@ -353,30 +357,33 @@ def main():
         SparkSession.builder.appName("ETL_Load")
         .config("spark.jars.packages", "org.postgresql:postgresql:42.7.3")
         .config("spark.sql.caseSensitive", "false")
+        .config("spark.sql.shuffle.partitions", "4")
         .getOrCreate()
     )
     # Truncate parent and child tables in Postgres to handle foreign key dependencies
     _truncate_prod_tables(spark)
 
-    apt  = _read(spark, "apartments")
-    demo = _read(spark, "demografia")
+    apt  = _read(spark, "apartments").cache()
+    demo = _read(spark, "demografia").cache()
 
     # Dimensions - Czas first (required for Fact join).
-    _load_dim_czas(spark, apt)
-    _load_dim_lokal(apt)
-    _load_dim_budynek(apt)
-    _load_dim_infrastruktura(apt)
-    _load_dim_demografia(demo)
-
-    # Read dimensions back from Postgres prod schema to ensure deterministic SKs
-    dim_czas  = _read_prod(spark, "Dim_Czas")
-    dim_lokal = _read_prod(spark, "Dim_Lokal")
-    dim_bud   = _read_prod(spark, "Dim_Budynek")
-    dim_infra = _read_prod(spark, "Dim_Infrastruktura")
-    dim_demo  = _read_prod(spark, "Dim_Demografia")
+    dim_czas  = _load_dim_czas(spark, apt)
+    dim_lokal = _load_dim_lokal(apt)
+    dim_bud   = _load_dim_budynek(apt)
+    dim_infra = _load_dim_infrastruktura(apt)
+    dim_demo  = _load_dim_demografia(demo)
 
     # Fact - loaded last, after all dimensions.
     _load_fact(apt, dim_lokal, dim_bud, dim_infra, dim_czas, dim_demo)
+
+    # Clean up cache
+    dim_czas.unpersist()
+    dim_lokal.unpersist()
+    dim_bud.unpersist()
+    dim_infra.unpersist()
+    dim_demo.unpersist()
+    apt.unpersist()
+    demo.unpersist()
 
     spark.stop()
 
