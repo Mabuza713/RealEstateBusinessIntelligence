@@ -176,21 +176,6 @@ def _stage_poi(spark, src_dir):
         )
     )
 
-
-# --- staging: macro (wskaźniki makro) ----------------------------------------
-def _stage_macro(spark, src_dir):
-    return (
-        _csv(spark, _glob_one(src_dir, "poland_real_estate_monthly*.csv"), ";")
-        .withColumn("Monthly_Wage_PLN", F.col("Monthly_Wage_PLN").cast(DecimalType(15, 2)))
-        .withColumn("data_date", F.to_date("Date"))
-        .withColumn("source_year", F.year("data_date"))
-        .withColumn("source_month", F.month("data_date"))
-        .filter(
-            F.col("Date").isNotNull() &
-            F.col("Monthly_Wage_PLN").isNotNull()
-        )
-    )
-
 # --- database ----------------------------------------------------------------
 _DB_COLUMNS = {
     "apartments": [
@@ -208,9 +193,6 @@ _DB_COLUMNS = {
     ],
     "poi": [
         "city", "name", "street", "number", "lat", "lon", "poi_type"
-    ],
-    "macro": [
-        "date", "monthly_wage_pln"
     ],
 }
 
@@ -279,7 +261,6 @@ def main():
         "apartments": _stage_apartments(spark, raw_dir),
         "demografia": _stage_demografia(spark, raw_dir),
         "poi": _stage_poi(spark, raw_dir),
-        "macro": _stage_macro(spark, raw_dir),
     }
 
     # Write clean records to PostgreSQL

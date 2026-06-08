@@ -289,11 +289,11 @@ def _load_fact(apt, dim_lokal, dim_budynek, dim_infra, dim_czas, dim_demo):
         .otherwise(F.lit(None))
     )
 
-    # Odchylenie % ceny — wymaga avg per (city, rooms, type) => self-join
-    avg_df = fact.groupBy("_city_norm", "rooms", "type").agg(
+    # Odchylenie % ceny — wymaga avg per (city, rooms, type, listing_type) => self-join
+    avg_df = fact.groupBy("_city_norm", "rooms", "type", "listing_type").agg(
         F.avg("Cena_Za_M2").alias("_avg_city_rooms_type")
     )
-    fact = fact.join(avg_df, on=["_city_norm", "rooms", "type"], how="left")
+    fact = fact.join(avg_df, on=["_city_norm", "rooms", "type", "listing_type"], how="left")
 
     fact = fact.withColumn(
         "Odchylenie_Procentowe_Ceny",
@@ -312,12 +312,26 @@ def _load_fact(apt, dim_lokal, dim_budynek, dim_infra, dim_czas, dim_demo):
         ).otherwise(F.lit(None))
     )
 
-    # Premia lokalizacyjna — wysoka vs niska liczba POI (> 15)
-    avg_poi_high = fact.filter(F.col("poicount") > 15).agg(F.avg("Cena_Za_M2").alias("_high")).collect()[0]["_high"]
-    avg_poi_low  = fact.filter(F.col("poicount") <= 15).agg(F.avg("Cena_Za_M2").alias("_low")).collect()[0]["_low"]
-    premia = float(avg_poi_high or 0) - float(avg_poi_low or 0)
+    # Obliczenie Premii Lokalizacyjnej oddzielnie dla 'sell' i 'rent'
+    def _calc_premia(df):
+        rows = df.agg(F.avg("Cena_Za_M2").alias("val")).collect()
+        return float(rows[0]["val"] or 0) if rows else 0.0
 
-    fact = fact.withColumn("Premia_Lokalizacyjna", F.lit(round(premia, 2)))
+    sell_fact = fact.filter(F.col("listing_type") == "sell")
+    avg_high_sell = _calc_premia(sell_fact.filter(F.col("poicount") > 15))
+    avg_low_sell  = _calc_premia(sell_fact.filter(F.col("poicount") <= 15))
+    premia_sell   = avg_high_sell - avg_low_sell
+
+    rent_fact = fact.filter(F.col("listing_type") == "rent")
+    avg_high_rent = _calc_premia(rent_fact.filter(F.col("poicount") > 15))
+    avg_low_rent  = _calc_premia(rent_fact.filter(F.col("poicount") <= 15))
+    premia_rent   = avg_high_rent - avg_low_rent
+
+    fact = fact.withColumn(
+        "Premia_Lokalizacyjna",
+        F.when(F.col("listing_type") == "sell", F.lit(round(premia_sell, 2)))
+        .otherwise(F.lit(round(premia_rent, 2)))
+    )
 
     result = fact.select(
         "ID_Lokalu", "ID_Budynku", "ID_Infrastruktury", "ID_Czasu", "ID_Demografii",

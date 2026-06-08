@@ -53,8 +53,3 @@ CREATE TABLE IF NOT EXISTS stg.poi (
     poi_type VARCHAR(50)
 );
 
-CREATE TABLE IF NOT EXISTS stg.macro (
-    Date VARCHAR(20),
-    Monthly_Wage_PLN NUMERIC(15, 2)
-);
-

@@ -12,7 +12,7 @@ _DATA = _ROOT / "data"
 _SOURCES = {
     "real_estate": (
         "get_real_estate_data.py", [], ",",
-        ["**/all_apartments_sell.csv", "**/all_apartments_rent.csv"],
+        ["data/raw/all_apartments_sell.csv", "data/raw/all_apartments_rent.csv"],
         ["source_date"], "source_date", None,
         [
             ("squareMeters", lambda s: pd.to_numeric(s, errors="coerce").between(10, 300), "squareMeters_out_of_range"),
@@ -27,7 +27,6 @@ _SOURCES = {
             ("Populacja_Ogolna", lambda s: pd.to_numeric(s, errors="coerce") > 0, "populacja_invalid"),
         ],
     ),
-    "life_cost": ("get_life_cost_data.py", ["--rok_od", "2023", "--rok_do", "2025"], ";", ["data/raw/poland_real_estate_monthly*.csv"], ["Date"], "Date", ["Date"], []),
     "overpass": (
         "get_overpass_data.py", [], ";",
         ["data/raw/all_cafes.csv", "data/raw/all_parkings.csv", "data/raw/all_bus_stops.csv"],
