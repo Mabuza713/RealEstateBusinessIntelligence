@@ -10,7 +10,6 @@ SOURCES = [
     ("real_estate", "extract_real_estate"),
     ("population", "extract_population"),
     ("overpass", "extract_overpass"),
-    ("life_cost", "extract_life_cost"),
 ]
 
 with DAG(

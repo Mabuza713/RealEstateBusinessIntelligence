@@ -232,3 +232,6 @@ data/val_split/*
 !data
 
 llm_context/
+
+# Airflow
+infra/airflow/logs/
