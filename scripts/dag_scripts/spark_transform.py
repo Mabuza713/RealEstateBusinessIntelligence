@@ -69,6 +69,50 @@ def _round_num(col, scale=2):
 
 
 # --- staging: apartments (Dim_Lokal, Dim_Budynek, Dim_Czas) ------------------
+def _get_latest_month_from_db(spark):
+    pg_user = os.environ.get("POSTGRES_USER", "postgres")
+    pg_password = os.environ.get("POSTGRES_PASSWORD", "postgres")
+    pg_db = os.environ.get("POSTGRES_DB", "postgres")
+    pg_host = os.environ.get("POSTGRES_HOST", "postgres")
+    pg_port = os.environ.get("POSTGRES_PORT", "5432")
+
+    url = f"jdbc:postgresql://{pg_host}:{pg_port}/{pg_db}"
+
+    # Sprawdzamy prod.dim_czas
+    try:
+        df = spark.read \
+            .format("jdbc") \
+            .option("url", url) \
+            .option("dbtable", "(SELECT MAX(source_date) as max_date FROM prod.dim_czas) as tmp") \
+            .option("user", pg_user) \
+            .option("password", pg_password) \
+            .option("driver", "org.postgresql.Driver") \
+            .load()
+        res = df.collect()
+        if res and res[0]["max_date"]:
+            return str(res[0]["max_date"])[:7]
+    except Exception:
+        pass
+
+    # Sprawdzamy stg.apartments
+    try:
+        df = spark.read \
+            .format("jdbc") \
+            .option("url", url) \
+            .option("dbtable", "(SELECT MAX(source_date) as max_date FROM stg.apartments) as tmp") \
+            .option("user", pg_user) \
+            .option("password", pg_password) \
+            .option("driver", "org.postgresql.Driver") \
+            .load()
+        res = df.collect()
+        if res and res[0]["max_date"]:
+            return str(res[0]["max_date"])[:7]
+    except Exception:
+        pass
+
+    return None
+
+
 def _stage_apartments(spark, src_dir):
     sources = [
         _csv(spark, f"{src_dir}/all_apartments_{kind}.csv").withColumn("listing_type", F.lit(kind))
@@ -80,6 +124,18 @@ def _stage_apartments(spark, src_dir):
         df
         .withColumn("city_norm", _norm_city(F.col("city")))
         .withColumn("source_date", F.to_date("source_date", "yyyy-MM"))
+    )
+
+    # Filtracja przyrostowa na poziomie transformacji
+    force_full_load = os.environ.get("FORCE_FULL_LOAD", "false").lower() == "true"
+    if not force_full_load:
+        latest_month = _get_latest_month_from_db(spark)
+        if latest_month:
+            print(f"[Transform] Znaleziono ostatni miesiąc w bazie: {latest_month}. Filtruję tylko nowsze wiersze.")
+            df = df.filter(F.col("source_date") > F.to_date(F.lit(f"{latest_month}-01")))
+
+    df = (
+        df
         .withColumn("source_year", F.year("source_date"))
         .withColumn("source_month", F.month("source_date"))
         .withColumn("square_meters", F.col("squareMeters").cast(DecimalType(10, 2)))

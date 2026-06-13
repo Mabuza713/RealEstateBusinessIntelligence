@@ -71,20 +71,95 @@ def _split(df: pd.DataFrame, req: list[str], date_col: str | None, keys: list[st
     return df[~bad].copy()
 
 
-def run_extract(source_id: str) -> int:
+def get_latest_month_from_db() -> str | None:
+    import os
+    import psycopg2
+    
+    pg_user = os.environ.get("POSTGRES_USER", "postgres")
+    pg_password = os.environ.get("POSTGRES_PASSWORD", "postgres")
+    pg_db = os.environ.get("POSTGRES_DB", "postgres")
+    pg_host = os.environ.get("POSTGRES_HOST", "postgres")
+    pg_port = os.environ.get("POSTGRES_PORT", "5432")
+    
+    conn = None
+    try:
+        conn = psycopg2.connect(
+            dbname=pg_db,
+            user=pg_user,
+            password=pg_password,
+            host=pg_host,
+            port=pg_port
+        )
+        with conn.cursor() as cur:
+            # Sprawdzamy czy tabela prod.dim_czas istnieje i ma rekordy
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_schema = 'prod' 
+                    AND table_name = 'dim_czas'
+                );
+            """)
+            if cur.fetchone()[0]:
+                cur.execute("SELECT MAX(source_date) FROM prod.dim_czas;")
+                res = cur.fetchone()
+                if res and res[0]:
+                    return str(res[0])[:7]
+            
+            # Sprawdzamy czy tabela stg.apartments istnieje i ma rekordy
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_schema = 'stg' 
+                    AND table_name = 'apartments'
+                );
+            """)
+            if cur.fetchone()[0]:
+                cur.execute("SELECT MAX(source_date) FROM stg.apartments;")
+                res = cur.fetchone()
+                if res and res[0]:
+                    # source_date to VARCHAR(10) w formacie YYYY-MM-DD
+                    return str(res[0])[:7]
+    except Exception as e:
+        print(f"Error querying database for latest month: {e}")
+    finally:
+        if conn:
+            conn.close()
+    return None
+
+
+def run_extract(source_id: str, check_existing: bool = True) -> int:
+    import os
     script, args, sep, patterns, req, date_col, keys, validators = _SOURCES[source_id]
     errors, rows_ok = [], 0
 
-    files_exist = all(
-        any(p.exists() and p.stat().st_size > 0 for p in _glob(pattern))
-        for pattern in patterns
-    )
+    run_args = [*args]
+    force_full_load = os.environ.get("FORCE_FULL_LOAD", "false").lower() == "true"
+    
+    latest_month = None
+    if source_id == "real_estate" and not force_full_load:
+        latest_month = get_latest_month_from_db()
+        if latest_month:
+            run_args.extend(["--after", latest_month])
+            print(f"[{source_id}] Znaleziono ostatni miesiąc w bazie: {latest_month}. Pobieram tylko nowsze dane.")
+
+    # Sprawdzamy czy pliki już istnieją i mają rozmiar > 0
+    # W przypadku przyrostowego ładowania nieruchomości zawsze odpalamy skrypt pobierania
+    if check_existing:
+        if source_id == "real_estate" and not force_full_load and latest_month:
+            files_exist = False
+        else:
+            files_exist = all(
+                any(p.exists() and p.stat().st_size > 0 for p in _glob(pattern))
+                for pattern in patterns
+            )
+    else:
+        files_exist = False
 
     if files_exist:
         print(f"[{source_id}] Pliki już istnieją, pomijam pobieranie.")
     else:
         try:
-            subprocess.run(["python", str(_scripts_dir() / script), *args], check=True, cwd=_scripts_dir())
+            subprocess.run(["python", str(_scripts_dir() / script), *run_args], check=True, cwd=_scripts_dir())
         except subprocess.CalledProcessError as exc:
             raise ExtractionError(f"[{source_id}] {exc}") from exc
 
@@ -95,7 +170,11 @@ def run_extract(source_id: str) -> int:
         if path.exists() and path.stat().st_size
     ]
     if not frames:
-        raise ExtractionError(f"[{source_id}] Brak plików po ekstrakcji")
+        try:
+            from airflow.exceptions import AirflowSkipException
+            raise AirflowSkipException(f"[{source_id}] Brak nowych danych do przetworzenia.")
+        except ImportError:
+            raise ExtractionError(f"[{source_id}] Brak plików po ekstrakcji (brak nowych danych)")
 
     for path, df in frames:
         missing = [col for col in req if col not in df.columns]

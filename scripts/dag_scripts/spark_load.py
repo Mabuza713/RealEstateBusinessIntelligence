@@ -86,15 +86,15 @@ def _write(df, table):
         .save()
 
 
-def _add_sk(df, col_name):
-    """Add a 1-based surrogate key column using monotonically_increasing_id."""
-    return df.coalesce(1).withColumn(col_name, F.monotonically_increasing_id() + 1)
+def _add_sk_incremental(df, col_name, start_id):
+    """Add a 1-based surrogate key column using monotonically_increasing_id starting from start_id."""
+    return df.coalesce(1).withColumn(col_name, F.monotonically_increasing_id() + 1 + start_id)
 
 
 # ---------------------------------------------------------------------------
 # Dim_Czas
 # ---------------------------------------------------------------------------
-def _load_dim_czas(spark, apt):
+def _load_dim_czas(spark, apt, force_full_load=False):
     df = (
         apt.select("source_date").distinct()
         .withColumn("source_date_str", F.col("source_date").cast("string"))
@@ -107,18 +107,35 @@ def _load_dim_czas(spark, apt):
             "miesiac", "rok", "source_date_m", "source_date_y",
         )
     )
-    df = _add_sk(df, "ID_Czasu").cache()
-    _write(df.select("ID_Czasu", "source_date", "miesiac", "rok", "source_date_m", "source_date_y"),
-           "Dim_Czas")
-    print(f"Load OK: prod.Dim_Czas ({df.count()} wierszy)")
-    return df  # returned with ID_Czasu for the Fact join
+    if force_full_load:
+        df = _add_sk_incremental(df, "ID_Czasu", 0).cache()
+        _write(df, "Dim_Czas")
+        print(f"Load OK (Full): prod.Dim_Czas ({df.count()} wierszy)")
+        return df
+    else:
+        existing = _read_prod(spark, "Dim_Czas").cache()
+        new_df = df.join(existing, on="source_date", how="left_anti")
+        max_id = existing.select(F.max("ID_Czasu")).collect()[0][0] or 0
+        new_df_with_id = _add_sk_incremental(new_df, "ID_Czasu", max_id).cache()
+        if new_df_with_id.count() > 0:
+            _write(new_df_with_id, "Dim_Czas")
+            print(f"Load OK (Incremental): prod.Dim_Czas (+{new_df_with_id.count()} wierszy)")
+        result_df = existing.unionByName(new_df_with_id).cache()
+        existing.unpersist()
+        new_df_with_id.unpersist()
+        return result_df
 
 
 # ---------------------------------------------------------------------------
 # Dim_Lokal
 # ---------------------------------------------------------------------------
-def _load_dim_lokal(apt):
-    df = _add_sk(
+def _load_dim_lokal(spark, apt, force_full_load=False):
+    max_id = 0
+    if not force_full_load:
+        existing = _read_prod(spark, "Dim_Lokal")
+        max_id = existing.select(F.max("ID_Lokalu")).collect()[0][0] or 0
+
+    df = _add_sk_incremental(
         apt.select(
             F.col("id").alias("source_id"),
             "listing_type", "source_date", "latitude", "longitude", "city",
@@ -129,7 +146,9 @@ def _load_dim_lokal(apt):
             "hasstorageroom", "hassecurity", "hasbalcony", "price", "ownership",
         ),
         "ID_Lokalu",
+        max_id
     ).cache()
+
     _write(
         df.select(
             "ID_Lokalu", "source_id", "listing_type",
@@ -151,8 +170,13 @@ def _load_dim_lokal(apt):
 # ---------------------------------------------------------------------------
 # Dim_Budynek
 # ---------------------------------------------------------------------------
-def _load_dim_budynek(apt):
-    df = _add_sk(
+def _load_dim_budynek(spark, apt, force_full_load=False):
+    max_id = 0
+    if not force_full_load:
+        existing = _read_prod(spark, "Dim_Budynek")
+        max_id = existing.select(F.max("ID_Budynku")).collect()[0][0] or 0
+
+    df = _add_sk_incremental(
         apt.select(
             F.col("id").alias("source_id"),
             "listing_type", "source_date", "city", "type",
@@ -160,7 +184,9 @@ def _load_dim_budynek(apt):
             F.col("buildingmaterial").alias("buildingMaterial"),
         ),
         "ID_Budynku",
+        max_id
     ).cache()
+
     _write(df.select("ID_Budynku", "source_id", "listing_type",
                      "city", "type", "buildYear", "buildingMaterial"),
            "Dim_Budynek")
@@ -171,7 +197,12 @@ def _load_dim_budynek(apt):
 # ---------------------------------------------------------------------------
 # Dim_Infrastruktura
 # ---------------------------------------------------------------------------
-def _load_dim_infrastruktura(apt):
+def _load_dim_infrastruktura(spark, apt, force_full_load=False):
+    max_id = 0
+    if not force_full_load:
+        existing = _read_prod(spark, "Dim_Infrastruktura")
+        max_id = existing.select(F.max("ID_Infrastruktury")).collect()[0][0] or 0
+
     dist_cols = [
         "centredistance", "schooldistance", "clinicdistance",
         "postofficedistance", "collegedistance", "kindergartendistance",
@@ -198,7 +229,7 @@ def _load_dim_infrastruktura(apt):
         else:
             sel.append(F.lit(None).cast(DecimalType(10, 2)).alias(extra))
 
-    df = _add_sk(apt.select(*sel), "ID_Infrastruktury").cache()
+    df = _add_sk_incremental(apt.select(*sel), "ID_Infrastruktury", max_id).cache()
     db_cols = [c for c in df.columns if c != "source_date"]
     _write(df.select(*db_cols), "Dim_Infrastruktura")
     print(f"Load OK: prod.Dim_Infrastruktura ({df.count()} wierszy)")
@@ -208,22 +239,34 @@ def _load_dim_infrastruktura(apt):
 # ---------------------------------------------------------------------------
 # Dim_Demografia
 # ---------------------------------------------------------------------------
-def _load_dim_demografia(demo):
-    df = _add_sk(
-        demo.select(
-            F.col("miasto_gus").alias("Miasto_GUS"),
-            F.col("glowne_miasto").alias("Glowne_Miasto"),
-            F.col("data").alias("Data"),
-            F.col("populacja_ogolna").cast(IntegerType()).alias("Populacja_Ogolna"),
-            F.col("zarejestrowani_bezrobotni").cast(IntegerType()).alias("Zarejestrowani_Bezrobotni"),
-            F.col("przecietne_wynagrodzenie_brutto").alias("Przecietne_Wynagrodzenie_Brutto"),
-            F.col("dochody_wlasne_jst").alias("Dochody_Wlasne_JST"),
-        ),
-        "ID_Demografii",
-    ).cache()
-    _write(df, "Dim_Demografia")
-    print(f"Load OK: prod.Dim_Demografii ({df.count()} wierszy)")
-    return df
+def _load_dim_demografia(spark, demo, force_full_load=False):
+    df = demo.select(
+        F.col("miasto_gus").alias("Miasto_GUS"),
+        F.col("glowne_miasto").alias("Glowne_Miasto"),
+        F.col("data").alias("Data"),
+        F.col("populacja_ogolna").cast(IntegerType()).alias("Populacja_Ogolna"),
+        F.col("zarejestrowani_bezrobotni").cast(IntegerType()).alias("Zarejestrowani_Bezrobotni"),
+        F.col("przecietne_wynagrodzenie_brutto").alias("Przecietne_Wynagrodzenie_Brutto"),
+        F.col("dochody_wlasne_jst").alias("Dochody_Wlasne_JST"),
+    )
+
+    if force_full_load:
+        df = _add_sk_incremental(df, "ID_Demografii", 0).cache()
+        _write(df, "Dim_Demografia")
+        print(f"Load OK (Full): prod.Dim_Demografii ({df.count()} wierszy)")
+        return df
+    else:
+        existing = _read_prod(spark, "Dim_Demografia").cache()
+        new_df = df.join(existing, on=["Miasto_GUS", "Data"], how="left_anti")
+        max_id = existing.select(F.max("ID_Demografii")).collect()[0][0] or 0
+        new_df_with_id = _add_sk_incremental(new_df, "ID_Demografii", max_id).cache()
+        if new_df_with_id.count() > 0:
+            _write(new_df_with_id, "Dim_Demografia")
+            print(f"Load OK (Incremental): prod.Dim_Demografii (+{new_df_with_id.count()} wierszy)")
+        result_df = existing.unionByName(new_df_with_id).cache()
+        existing.unpersist()
+        new_df_with_id.unpersist()
+        return result_df
 
 
 # ---------------------------------------------------------------------------
@@ -319,19 +362,22 @@ def main():
         .config("spark.sql.shuffle.partitions", "4")
         .getOrCreate()
     )
-    # Truncate parent and child tables in Postgres to handle foreign key dependencies
-    _truncate_prod_tables(spark)
+    
+    force_full_load = os.environ.get("FORCE_FULL_LOAD", "false").lower() == "true"
+    if force_full_load:
+        # Truncate parent and child tables in Postgres to handle foreign key dependencies
+        _truncate_prod_tables(spark)
 
     apt  = _read(spark, "apartments").cache()
     demo = _read(spark, "demografia").cache()
     apt_measures = _read(spark, "apartments_measures").cache()
 
     # Dimensions - Czas first (required for Fact join).
-    dim_czas  = _load_dim_czas(spark, apt)
-    dim_lokal = _load_dim_lokal(apt)
-    dim_bud   = _load_dim_budynek(apt)
-    dim_infra = _load_dim_infrastruktura(apt)
-    dim_demo  = _load_dim_demografia(demo)
+    dim_czas  = _load_dim_czas(spark, apt, force_full_load)
+    dim_lokal = _load_dim_lokal(spark, apt, force_full_load)
+    dim_bud   = _load_dim_budynek(spark, apt, force_full_load)
+    dim_infra = _load_dim_infrastruktura(spark, apt, force_full_load)
+    dim_demo  = _load_dim_demografia(spark, demo, force_full_load)
 
     # Fact - loaded last, after all dimensions.
     _load_fact(apt, dim_lokal, dim_bud, dim_infra, dim_czas, dim_demo, apt_measures)
