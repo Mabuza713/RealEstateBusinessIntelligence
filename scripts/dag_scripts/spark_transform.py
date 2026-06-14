@@ -42,7 +42,10 @@ def _union(dfs):
 
 
 def _csv(spark, path, sep=","):
-    return spark.read.option("header", True).option("sep", sep).csv(path)
+    df = spark.read.option("header", True).option("sep", sep).csv(path)
+    if df.columns and df.columns[0].startswith('\ufeff'):
+        df = df.withColumnRenamed(df.columns[0], df.columns[0][1:])
+    return df
 
 
 def _glob_one(folder, pattern):
@@ -238,9 +241,9 @@ _DB_COLUMNS = {
         "id", "city", "type", "squaremeters", "rooms", "floor", "floorcount", "buildyear",
         "latitude", "longitude", "centredistance", "poicount", "schooldistance", "clinicdistance",
         "postofficedistance", "kindergartendistance", "restaurantdistance", "collegedistance",
-        "pharmacydistance", "ownership", "buildingmaterial", "condition", "hasparkingspace",
-        "hasbalcony", "haselevator", "hassecurity", "hasstorageroom", "price", "source_date",
-        "listing_type"
+        "pharmacydistance", "busstopdistance", "caffedistance", "parkingdistance", "ownership",
+        "buildingmaterial", "condition", "hasparkingspace", "hasbalcony", "haselevator",
+        "hassecurity", "hasstorageroom", "price", "source_date", "listing_type"
     ],
     "demografia": [
         "miasto_gus", "glowne_miasto", "data", "populacja_ogolna",
@@ -313,10 +316,69 @@ def main():
     spark.sparkContext.setLogLevel("WARN")
 
     # Load and clean tables directly from raw (Spark filters apply)
+    apt_df = _stage_apartments(spark, raw_dir)
+    demografia_df = _stage_demografia(spark, raw_dir)
+    poi_df = _stage_poi(spark, raw_dir)
+
+    # Calculate distances to nearest POIs: cafe, parking, bus_stop
+    filtered_poi = poi_df.filter(F.col("poi_type").isin("cafe", "parking", "bus_stop")) \
+                         .select(F.col("city_norm").alias("_poi_city"), 
+                                 F.col("poi_type").alias("_poi_type"),
+                                 F.col("latitude").alias("_poi_lat"), 
+                                 F.col("longitude").alias("_poi_lon"))
+    
+    # Join on city_norm — używamy apt_for_poi (pochodnego DF) zamiast apt_df["city_norm"],
+    # bo Spark nie może rozwiązać kolumny z zewnętrznego DF w kontekście pochodnego.
+    apt_for_poi = apt_df.select("id", "listing_type", "source_date", "city_norm", "latitude", "longitude")
+    joined = apt_for_poi.join(filtered_poi, apt_for_poi["city_norm"] == filtered_poi["_poi_city"], "left")
+    
+    # Haversine distance in km
+    r = 6371.0
+    lat1 = F.radians(F.col("latitude"))
+    lon1 = F.radians(F.col("longitude"))
+    lat2 = F.radians(F.col("_poi_lat"))
+    lon2 = F.radians(F.col("_poi_lon"))
+    
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    
+    a = F.sin(dlat / 2.0)**2 + F.cos(lat1) * F.cos(lat2) * F.sin(dlon / 2.0)**2
+    c = 2.0 * F.atan2(F.sqrt(a), F.sqrt(1.0 - a))
+    dist = r * c
+    
+    # Group by unique keys and aggregate minimum distance per POI type
+    min_dist_df = joined.withColumn("_dist", dist) \
+                        .groupBy("id", "listing_type", "source_date") \
+                        .agg(
+                            F.round(F.min(F.when(F.col("_poi_type") == "cafe", F.col("_dist"))), 3).alias("caffeDistance"),
+                            F.round(F.min(F.when(F.col("_poi_type") == "parking", F.col("_dist"))), 3).alias("parkingDistance"),
+                            F.round(F.min(F.when(F.col("_poi_type") == "bus_stop", F.col("_dist"))), 3).alias("busstopDistance")
+                        )
+    
+    # Rename original distance columns (if present in the raw CSV) to temp names so
+    # the join below does not produce duplicate/ambiguous column names.
+    _orig_cols = {"caffeDistance": "_orig_caffedistance",
+                  "parkingDistance": "_orig_parkingdistance",
+                  "busstopDistance": "_orig_busstopdistance"}
+    for _src, _tmp in _orig_cols.items():
+        if _src in apt_df.columns:
+            apt_df = apt_df.withColumnRenamed(_src, _tmp)
+
+    # Join freshly computed distances (caffeDistance / parkingDistance / busstopDistance)
+    apt_df = apt_df.join(min_dist_df, on=["id", "listing_type", "source_date"], how="left")
+
+    # Coalesce: prefer the POI-computed value; fall back to the original CSV value when
+    # the POI file is missing or city_norm did not match (e.g. empty all_bus_stops.csv).
+    for _new, _tmp in [("caffeDistance",   "_orig_caffedistance"),
+                        ("parkingDistance", "_orig_parkingdistance"),
+                        ("busstopDistance", "_orig_busstopdistance")]:
+        if _tmp in apt_df.columns:
+            apt_df = apt_df.withColumn(_new, F.coalesce(F.col(_new), F.col(_tmp))).drop(_tmp)
+
     tables = {
-        "apartments": _stage_apartments(spark, raw_dir),
-        "demografia": _stage_demografia(spark, raw_dir),
-        "poi": _stage_poi(spark, raw_dir),
+        "apartments": apt_df,
+        "demografia": demografia_df,
+        "poi": poi_df,
     }
 
     # Write clean records to PostgreSQL

@@ -10,6 +10,7 @@ _DISTANCE_COLS = [
     "schooldistance", "clinicdistance", "postofficedistance",
     "kindergartendistance", "restaurantdistance", "collegedistance",
     "pharmacydistance", "centredistance",
+    "busstopdistance", "caffedistance", "parkingdistance",
 ]
 
 _BUILDING_COLS = ["buildingmaterial", "condition"]
@@ -154,81 +155,108 @@ def _impute_spatial_pandas(pdf):
     cities = pdf["city"].values
 
     # 1. Imputacja cech budynku: buildingmaterial, condition, buildyear
-    is_missing_mat = pdf["buildingmaterial"].isna() | (pdf["buildingmaterial"].str.strip() == "brak informacji")
-    is_missing_cond = pdf["condition"].isna() | (pdf["condition"].str.strip() == "brak informacji")
-    is_missing_year = pdf["buildyear"].isna() | (pdf["buildyear"] <= 0)
-    is_missing_bldg = is_missing_mat | is_missing_cond | is_missing_year
+    #
+    # WAŻNE: każdy atrybut ma własną siatkę kandydatów.
+    # Stara implementacja używała jednej siatki opartej na known_mask = ~(missing_mat | missing_cond | missing_year),
+    # co wykluczało rekord z puli źródeł, jeśli brakowało choćby jednego pola.
+    # Np. rekord z buildingmaterial=brick ale bez condition nie trafiał do puli — stąd masowe "brak informacji".
+    is_missing_mat  = pdf["buildingmaterial"].isna() | (pdf["buildingmaterial"].str.strip().isin(["brak informacji", ""]))
+    is_missing_cond = pdf["condition"].isna()         | (pdf["condition"].str.strip().isin(["brak informacji", ""]))
+    is_missing_year = pdf["buildyear"].isna()         | (pdf["buildyear"] <= 0)
+    is_missing_type = pdf["type"].isna()              | (pdf["type"].str.strip().isin(["brak informacji", ""]))
+    is_missing_bldg = is_missing_mat | is_missing_cond | is_missing_year | is_missing_type
 
-    known_mask = ~is_missing_bldg
-    grid_size = 0.018  # 2km
+    grid_size = 0.018  # ~2km komórka siatki
 
-    grid = {}
-    for idx in np.where(known_mask)[0]:
-        c_lat = int(lat[idx] / grid_size)
-        c_lon = int(lon[idx] / grid_size)
-        key = (c_lat, c_lon)
-        if key not in grid:
-            grid[key] = []
-        grid[key].append(idx)
+    # Budujemy osobną siatkę dla każdego atrybutu
+    def _build_grid(mask):
+        g = {}
+        for i in np.where(mask)[0]:
+            key = (int(lat[i] / grid_size), int(lon[i] / grid_size))
+            g.setdefault(key, []).append(i)
+        return g
 
-    # Mediany/dominanty per miasto (fallbacks)
-    city_mat_mode = pdf[known_mask].groupby("city")["buildingmaterial"].agg(lambda x: x.mode().iloc[0] if not x.mode().empty else "brak informacji").to_dict()
-    city_cond_mode = pdf[known_mask].groupby("city")["condition"].agg(lambda x: x.mode().iloc[0] if not x.mode().empty else "brak informacji").to_dict()
-    city_year_median = pdf[known_mask & (pdf["buildyear"] > 0)].groupby("city")["buildyear"].median().to_dict()
+    grid_mat  = _build_grid(~is_missing_mat)
+    grid_cond = _build_grid(~is_missing_cond)
+    grid_year = _build_grid(~is_missing_year)
+    grid_type = _build_grid(~is_missing_type)
 
-    for idx in np.where(is_missing_bldg)[0]:
-        m_lat, m_lon = lat[idx], lon[idx]
-        m_city = cities[idx]
-        c_lat = int(m_lat / grid_size)
-        c_lon = int(m_lon / grid_size)
+    # Fallback: dominanta/mediana per miasto — też oparta na własnej masce per atrybut
+    city_mat_mode    = pdf[~is_missing_mat].groupby("city")["buildingmaterial"].agg(
+        lambda x: x.mode().iloc[0] if not x.mode().empty else "brak informacji").to_dict()
+    city_cond_mode   = pdf[~is_missing_cond].groupby("city")["condition"].agg(
+        lambda x: x.mode().iloc[0] if not x.mode().empty else "brak informacji").to_dict()
+    city_year_median = pdf[~is_missing_year & (pdf["buildyear"] > 0)].groupby("city")["buildyear"].median().to_dict()
+    city_type_mode   = pdf[~is_missing_type].groupby("city")["type"].agg(
+        lambda x: x.mode().iloc[0] if not x.mode().empty else "brak informacji").to_dict()
 
-        candidates = []
+    def _nearby(grid, idx, m_lat, m_lon, m_city):
+        """Zwraca listę kandydatów z 3×3 sąsiednich komórek siatki w tym samym mieście."""
+        c_lat, c_lon = int(m_lat / grid_size), int(m_lon / grid_size)
+        cands = []
         for dy in (-1, 0, 1):
             for dx in (-1, 0, 1):
-                key = (c_lat + dy, c_lon + dx)
-                if key in grid:
-                    candidates.extend(grid[key])
+                cands.extend(grid.get((c_lat + dy, c_lon + dx), []))
+        return [c for c in cands if c != idx and cities[c] == m_city]
 
-        candidates = [c for c in candidates if c != idx and cities[c] == m_city]
+    _NEAR_THRESH  = 0.00135   # ~150m — skopiuj dosłownie od 1 sąsiada
+    _VOTE_RADIUS  = 0.135     # ~15km — promień głosowania
+    _TOP_K        = 20
 
-        if candidates:
-            c_lats = lat[candidates]
-            c_lons = lon[candidates]
-            dists = np.sqrt((c_lats - m_lat)**2 + (c_lons - m_lon)**2)
+    def _impute_categorical(idx, m_lat, m_lon, m_city, grid, col, fallback):
+        cands = _nearby(grid, idx, m_lat, m_lon, m_city)
+        if not cands:
+            return "brak informacji"
+        c_lats, c_lons = lat[cands], lon[cands]
+        dists = np.sqrt((c_lats - m_lat) ** 2 + (c_lons - m_lon) ** 2)
+        nearest = int(np.argmin(dists))
+        if dists[nearest] <= _NEAR_THRESH:
+            v = pdf.at[cands[nearest], col]
+            if pd.notna(v) and str(v).strip() not in ("brak informacji", ""):
+                return v
+        valid = np.where(dists <= _VOTE_RADIUS)[0]
+        if len(valid) == 0:
+            # Brak sąsiadów w promieniu głosowania — nie zgadujemy
+            return "brak informacji"
+        top_k = [cands[i] for i in valid[np.argsort(dists[valid])][:_TOP_K]]
+        vals = [pdf.at[i, col] for i in top_k
+                if pd.notna(pdf.at[i, col]) and str(pdf.at[i, col]).strip() not in ("brak informacji", "")]
+        return max(set(vals), key=vals.count) if vals else "brak informacji"
 
-            min_dist_idx = np.argmin(dists)
-            if dists[min_dist_idx] <= 0.00045:  # 50m
-                nearest_idx = candidates[min_dist_idx]
-                if is_missing_mat[idx]:
-                    pdf.at[idx, "buildingmaterial"] = pdf.at[nearest_idx, "buildingmaterial"]
-                if is_missing_cond[idx]:
-                    pdf.at[idx, "condition"] = pdf.at[nearest_idx, "condition"]
-                if is_missing_year[idx]:
-                    pdf.at[idx, "buildyear"] = pdf.at[nearest_idx, "buildyear"]
-                continue
+    def _impute_year(idx, m_lat, m_lon, m_city):
+        cands = _nearby(grid_year, idx, m_lat, m_lon, m_city)
+        fallback = int(city_year_median.get(m_city, 2000))
+        if not cands:
+            return fallback
+        c_lats, c_lons = lat[cands], lon[cands]
+        dists = np.sqrt((c_lats - m_lat) ** 2 + (c_lons - m_lon) ** 2)
+        nearest = int(np.argmin(dists))
+        if dists[nearest] <= _NEAR_THRESH:
+            return int(pdf.at[cands[nearest], "buildyear"])
+        valid = np.where(dists <= _VOTE_RADIUS)[0]
+        if len(valid) == 0:
+            return fallback
+        top_k = [cands[i] for i in valid[np.argsort(dists[valid])][:_TOP_K]]
+        years = [pdf.at[i, "buildyear"] for i in top_k if pdf.at[i, "buildyear"] > 0]
+        return int(np.median(years)) if years else fallback
 
-            valid_indices = np.where(dists <= 0.018)[0]
-            if len(valid_indices) > 0:
-                sorted_valid = valid_indices[np.argsort(dists[valid_indices])][:10]
-                top_k_idxs = [candidates[i] for i in sorted_valid]
-
-                if is_missing_mat[idx]:
-                    mats = [pdf.at[i, "buildingmaterial"] for i in top_k_idxs if pd.notna(pdf.at[i, "buildingmaterial"]) and pdf.at[i, "buildingmaterial"] != "brak informacji"]
-                    pdf.at[idx, "buildingmaterial"] = max(set(mats), key=mats.count) if mats else city_mat_mode.get(m_city, "brak informacji")
-                if is_missing_cond[idx]:
-                    conds = [pdf.at[i, "condition"] for i in top_k_idxs if pd.notna(pdf.at[i, "condition"]) and pdf.at[i, "condition"] != "brak informacji"]
-                    pdf.at[idx, "condition"] = max(set(conds), key=conds.count) if conds else city_cond_mode.get(m_city, "brak informacji")
-                if is_missing_year[idx]:
-                    years = [pdf.at[i, "buildyear"] for i in top_k_idxs if pdf.at[i, "buildyear"] > 0]
-                    pdf.at[idx, "buildyear"] = int(np.median(years)) if years else int(city_year_median.get(m_city, 2000))
-                continue
-
+    for idx in np.where(is_missing_bldg)[0]:
+        m_lat, m_lon, m_city = lat[idx], lon[idx], cities[idx]
         if is_missing_mat[idx]:
-            pdf.at[idx, "buildingmaterial"] = city_mat_mode.get(m_city, "brak informacji")
+            pdf.at[idx, "buildingmaterial"] = _impute_categorical(
+                idx, m_lat, m_lon, m_city, grid_mat, "buildingmaterial",
+                city_mat_mode.get(m_city, "brak informacji"))
         if is_missing_cond[idx]:
-            pdf.at[idx, "condition"] = city_cond_mode.get(m_city, "brak informacji")
+            pdf.at[idx, "condition"] = _impute_categorical(
+                idx, m_lat, m_lon, m_city, grid_cond, "condition",
+                city_cond_mode.get(m_city, "brak informacji"))
         if is_missing_year[idx]:
-            pdf.at[idx, "buildyear"] = int(city_year_median.get(m_city, 2000))
+            pdf.at[idx, "buildyear"] = _impute_year(idx, m_lat, m_lon, m_city)
+        if is_missing_type[idx]:
+            pdf.at[idx, "type"] = _impute_categorical(
+                idx, m_lat, m_lon, m_city, grid_type, "type",
+                city_type_mode.get(m_city, "brak informacji"))
+
 
     # 2. Imputacja udogodnień: hasparkingspace, hasbalcony, haselevator, hassecurity, hasstorageroom
     amenity_cols = ["hasparkingspace", "hasbalcony", "haselevator", "hassecurity", "hasstorageroom"]

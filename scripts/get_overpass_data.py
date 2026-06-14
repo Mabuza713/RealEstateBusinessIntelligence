@@ -3,6 +3,9 @@ import os
 import time
 import urllib.request
 import overpy
+import socket
+
+socket.setdefaulttimeout(60)
 
 opener = urllib.request.build_opener()
 opener.addheaders = [("User-agent", "WyszukiwarkaOSM/1.0 (testowy-skrypt)")]
@@ -10,25 +13,43 @@ urllib.request.install_opener(opener)
 
 
 def FetchAndAppendPoints(city, point_type, key, filename):
-    api = overpy.Overpass()
-
     query = f"""
-    [out:json];
+    [out:json][timeout:180];
     area[name="{city}"]->.searchArea;
     node["{key}"="{point_type}"](area.searchArea);
     out;
     """
 
+    endpoints = [
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://overpass-api.de/api/interpreter",
+        "https://z.overpass-api.de/api/interpreter",
+    ]
+
+    result = None
+    for url in endpoints:
+        try:
+            print(f"  Próba pobrania dla miasta {city} ({point_type}) z serwera: {url}...")
+            api = overpy.Overpass(url=url)
+            result = api.query(query)
+            print(
+                f"  Pobrano {len(result.nodes)} obiektów dla miasta {city} ({point_type}) z serwera {url}"
+            )
+            break
+        except overpy.exception.OverpassTooManyRequests:
+            print(
+                f"  Błąd: Zbyt wiele zapytań do serwera {url}. Czekam 10s i próbuję dalej..."
+            )
+            time.sleep(10)
+        except Exception as e:
+            print(f"  Błąd dla serwera {url} przy pobieraniu {city}: {e}")
+
+    if not result or len(result.nodes) == 0:
+        print(f"  Brak danych lub błąd dla miasta {city} ({point_type})")
+        return
+
     try:
-        result = api.query(query)
-        print(
-            f"  Pobrano {len(result.nodes)} obiektów dla miasta {city} ({point_type})"
-        )
-
-        if len(result.nodes) == 0:
-            return
-
-        # Upewniamy się, że katalog docelowy istnieje (np. ../data_raw/)
+        # Upewniamy się, że katalog docelowy istnieje (np. ../data/raw/)
         if os.path.dirname(filename):
             os.makedirs(os.path.dirname(filename), exist_ok=True)
 
@@ -39,7 +60,6 @@ def FetchAndAppendPoints(city, point_type, key, filename):
         with open(
             filename, mode="a", newline="", encoding="utf-8-sig"
         ) as csv_file:
-            # Dodałem kolumnę 'City' jako pierwszy element struktury
             fieldnames = ["City", "Name", "Street", "Number", "LAT", "LON"]
             writer = csv.DictWriter(
                 csv_file, fieldnames=fieldnames, delimiter=";"
@@ -67,13 +87,8 @@ def FetchAndAppendPoints(city, point_type, key, filename):
                     }
                 )
 
-    except overpy.exception.OverpassTooManyRequests:
-        print(
-            "  Błąd: Zbyt wiele zapytań do API (OverpassTooManyRequests). Czekam 10s..."
-        )
-        time.sleep(10)
     except Exception as e:
-        print(f"  Wystąpił błąd przy pobieraniu {city}: {e}")
+        print(f"  Wystąpił błąd przy zapisie danych dla {city}: {e}")
 
 
 if __name__ == "__main__":
@@ -88,6 +103,11 @@ if __name__ == "__main__":
         "Bydgoszcz",
         "Lublin",
         "Białystok",
+        "Gdynia",
+        "Katowice",
+        "Radom",
+        "Rzeszów",
+        "Częstochowa",
     ]
 
     # Definiujemy ścieżki do trzech zbiorczych plików
@@ -98,7 +118,6 @@ if __name__ == "__main__":
     }
 
     # WAŻNE: Czyścimy stare pliki na początku uruchomienia programu.
-    # Dzięki temu, jeśli uruchomisz skrypt ponownie, dane nie będą się dublować w nieskończoność.
     for path in output_files.values():
         if os.path.exists(path):
             try:
@@ -129,5 +148,5 @@ if __name__ == "__main__":
         print("Czekam 5 sekund przed kolejnym miastem...")
         time.sleep(5)
     print(
-        "\nSukces! Wszystkie dane zostały pobrane i połączone w 3 plikach zbiorczych w katalogu '../data_raw/'."
+        "\nSukces! Wszystkie dane zostały pobrane i połączone w 3 plikach zbiorczych w katalogu '../data/raw/'."
     )
