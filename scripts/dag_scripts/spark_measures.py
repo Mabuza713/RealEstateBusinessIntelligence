@@ -107,25 +107,25 @@ def main():
     df = df.withColumn(
         "stosunek_najmu_do_wynagrodzenia",
         F.when(
-            (F.col("listing_type") == "rent") & F.col("wage").isNotNull() & (F.col("wage") > 0),
+            (F.col("listing_type") == "Wynajem") & F.col("wage").isNotNull() & (F.col("wage") > 0),
             F.col("price").cast("double") / F.col("wage").cast("double")
         ).otherwise(F.lit(None))
     )
 
-    # 5. Obliczenie Premia_Lokalizacyjna (KPI 3) — oddzielnie dla 'sell' i 'rent'
+    # 5. Obliczenie Premia_Lokalizacyjna (KPI 3) — oddzielnie dla 'Sprzedaż' i 'Wynajem'
     def _calc_premia(fdf):
         rows = fdf.agg(F.avg("cena_za_m2").alias("val")).collect()
         return float(rows[0]["val"] or 0) if rows else 0.0
 
-    sell_df = df.filter(F.col("listing_type") == "sell")
+    sell_df = df.filter(F.col("listing_type") == "Sprzedaż")
     premia_sell = _calc_premia(sell_df.filter(F.col("poicount") > 15)) - _calc_premia(sell_df.filter(F.col("poicount") <= 15))
 
-    rent_df = df.filter(F.col("listing_type") == "rent")
+    rent_df = df.filter(F.col("listing_type") == "Wynajem")
     premia_rent = _calc_premia(rent_df.filter(F.col("poicount") > 15)) - _calc_premia(rent_df.filter(F.col("poicount") <= 15))
 
     df = df.withColumn(
         "premia_lokalizacyjna",
-        F.when(F.col("listing_type") == "sell", F.lit(round(premia_sell, 2)))
+        F.when(F.col("listing_type") == "Sprzedaż", F.lit(round(premia_sell, 2)))
         .otherwise(F.lit(round(premia_rent, 2)))
     )
 

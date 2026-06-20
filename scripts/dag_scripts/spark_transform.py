@@ -157,13 +157,50 @@ def _stage_apartments(spark, src_dir):
         .withColumn("centre_distance", _round_num("centreDistance"))
     )
 
-    for col in APT_TEXT_COLS:
-        if col in df.columns:
-            df = df.withColumn(col, _missing_label(F.col(col)))
+    # Map values to Polish and manager-friendly names
+    df = (
+        df
+        .withColumn("listing_type",
+            F.when(F.col("listing_type") == "sell", F.lit("Sprzedaż"))
+            .when(F.col("listing_type") == "rent", F.lit("Wynajem"))
+            .otherwise(F.col("listing_type"))
+        )
+        .withColumn("buildingMaterial",
+            F.when(F.col("buildingMaterial") == "brick", F.lit("Cegła"))
+            .when(F.col("buildingMaterial") == "concreteSlab", F.lit("Wielka płyta"))
+            .when(F.col("buildingMaterial").isNull() | (F.trim(F.col("buildingMaterial")) == "") | (F.lower(F.col("buildingMaterial")) == "brak informacji"), F.lit("Brak informacji"))
+            .otherwise(F.col("buildingMaterial"))
+        )
+        .withColumn("condition",
+            F.when(F.col("condition") == "low", F.lit("Do remontu"))
+            .when(F.col("condition") == "premium", F.lit("Wysoki standard"))
+            .when(F.col("condition").isNull() | (F.trim(F.col("condition")) == "") | (F.lower(F.col("condition")) == "brak informacji"), F.lit("Brak informacji"))
+            .otherwise(F.col("condition"))
+        )
+        .withColumn("ownership",
+            F.when(F.col("ownership") == "condominium", F.lit("Własność"))
+            .when(F.col("ownership") == "cooperative", F.lit("Spółdzielcze własnościowe"))
+            .when(F.col("ownership").like("%udzia%"), F.lit("Udział w nieruchomości"))
+            .when(F.col("ownership").isNull() | (F.trim(F.col("ownership")) == "") | (F.lower(F.col("ownership")) == "brak informacji"), F.lit("Brak informacji"))
+            .otherwise(F.col("ownership"))
+        )
+        .withColumn("type",
+            F.when(F.col("type") == "blockOfFlats", F.lit("Blok mieszkalny"))
+            .when(F.col("type") == "tenement", F.lit("Kamienica"))
+            .when(F.col("type") == "apartmentBuilding", F.lit("Apartamentowiec"))
+            .when(F.col("type").isNull() | (F.trim(F.col("type")) == "") | (F.lower(F.col("type")) == "brak informacji"), F.lit("Brak informacji"))
+            .otherwise(F.col("type"))
+        )
+    )
 
     for col in APT_AMENITY_COLS:
         if col in df.columns:
-            df = df.withColumn(col, _missing_label(F.col(col)))
+            df = df.withColumn(col,
+                F.when(F.col(col) == "yes", F.lit("Tak"))
+                .when(F.col(col) == "no", F.lit("Nie"))
+                .when(F.col(col).isNull() | (F.trim(F.col(col)) == "") | (F.lower(F.col(col)) == "brak") | (F.lower(F.col(col)) == "brak informacji"), F.lit("Brak informacji"))
+                .otherwise(F.col(col))
+            )
 
     distance_cols = [c for c in df.columns if c.endswith("Distance")]
     for col in distance_cols:
