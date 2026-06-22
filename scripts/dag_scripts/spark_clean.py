@@ -1,12 +1,19 @@
+"""
+Krok II potoku transformacji Sparka: Czyszczenie i Imputacja.
+Skrypt odczytuje tabele ze stagingu (stg.*), dokonuje zaawansowanego czyszczenia
+demografii oraz dwufazowej imputacji braków przestrzennych dla ofert mieszkań (IDW
+oraz Spatial Grid Index) w Pandas/NumPy zrównoleglonym na executorach Sparka.
+"""
+
 import os
 from datetime import datetime
-from decimal import Decimal
 import numpy as np
 import pandas as pd
 
 from pyspark.sql import SparkSession, Window, functions as F
-from pyspark.sql.types import IntegerType
+from pyspark.sql.types import IntegerType, DecimalType
 
+# Lista kolumn odległościowych podlegających imputacji IDW
 _DISTANCE_COLS = [
     "schooldistance", "clinicdistance", "postofficedistance",
     "kindergartendistance", "restaurantdistance", "collegedistance",
@@ -16,7 +23,8 @@ _DISTANCE_COLS = [
 
 _BUILDING_COLS = ["buildingmaterial", "condition"]
 
-_IDW_K = 10          # max neighbors to average
+# Maksymalna liczba sąsiadów brana pod uwagę przy uśrednianiu IDW
+_IDW_K = 10
 
 
 # ---------------------------------------------------------------------------
@@ -24,6 +32,7 @@ _IDW_K = 10          # max neighbors to average
 # ---------------------------------------------------------------------------
 
 def _pg_opts(spark, table):
+    """Odczytuje tabelę stagingową z bazy PostgreSQL i zwraca ramkę danych Spark oraz parametry połączenia."""
     pg_user = os.environ.get("POSTGRES_USER", "postgres")
     pg_password = os.environ.get("POSTGRES_PASSWORD", "postgres")
     pg_db = os.environ.get("POSTGRES_DB", "postgres")
@@ -42,6 +51,7 @@ def _pg_opts(spark, table):
 
 
 def _write_postgres(df, table, url, user, password):
+    """Zapisuje wyczyszczoną ramkę danych z powrotem do bazy PostgreSQL w trybie overwrite z truncate."""
     if "source_date" in df.columns:
         df = df.withColumn("source_date", F.col("source_date").cast("string"))
     df.write \
@@ -62,9 +72,10 @@ def _write_postgres(df, table, url, user, password):
 
 def _clean_demografia(df):
     """
-    Merge demographic and wage rows for the same city and date,
-    fill in missing values, and drop rows that fail consistency checks.
+    Agreguje wskaźniki demograficzne GUS dla tego samego miasta i daty (first ignorenulls),
+    koryguje błąd skali populacji GUS (mnożnik 10) i wylicza sumaryczną populację ogólną.
     """
+    # Konsolidacja wielu rekordów z tego samego dnia (GUS zwraca osobne wiersze)
     agg_df = df.groupBy("glowne_miasto", "data").agg(
         F.coalesce(
             F.first(F.when(F.col("miasto_gus").like("%m.%") | F.col("miasto_gus").like("%st.%"), F.col("miasto_gus")), ignorenulls=True),
@@ -78,6 +89,7 @@ def _clean_demografia(df):
         F.first("dochody_wlasne_jst", ignorenulls=True).alias("dochody_wlasne_jst")
     )
 
+    # Korekta systematycznego błędu skali płci z API GUS (skala 1:10) i wyliczenie sumy
     agg_df = (
         agg_df
         .withColumn("populacja_mezczyzni", F.col("populacja_mezczyzni") * 10)
@@ -85,9 +97,13 @@ def _clean_demografia(df):
         .withColumn("populacja_ogolna", F.col("populacja_mezczyzni") + F.col("populacja_kobiety"))
     )
 
+    # Filtrowanie wierszy z błędną lub pustą populacją / pensją
     filtered_df = agg_df.filter(
         F.col("miasto_gus").isNotNull() & (F.trim(F.col("miasto_gus")) != "") &
-        F.col("populacja_ogolna").isNotNull() & (F.col("populacja_ogolna") > 0)
+        (
+            (F.col("populacja_ogolna").isNotNull() & (F.col("populacja_ogolna") > 0)) |
+            F.col("przecietne_wynagrodzenie_brutto").isNotNull()
+        )
     )
 
     return filtered_df.select(
@@ -98,123 +114,126 @@ def _clean_demografia(df):
 
 
 # ---------------------------------------------------------------------------
-# IDW w Pandas — O(n_missing * k) za pomocą indeksu siatki
+# IDW przez grid-bucketing (Pandas/NumPy)
 # ---------------------------------------------------------------------------
 
-def _impute_idw_pandas(pdf, col):
+def _idw_impute_pandas(pdf, col):
+    """
+    Wektorowa implementacja Inverse Distance Weighting w Pandas/NumPy.
+    Dla brakujących współrzędnych wyszukuje 10 najbliższych punktów w tym samym mieście,
+    liczy odległości euklidesowe, a następnie wyznacza średnią ważoną (waga = 1/d).
+    W celu uniknięcia OOM dzieli proces na paczki po 1000 wierszy.
+    """
     if col not in pdf.columns:
         return pdf
-
+    
+    is_null = pdf[col].isna()
+    if not is_null.any():
+        return pdf
+        
+    known_mask = ~is_null
+    # Obliczenie mediany z poziomu miasta jako fallback
+    city_medians = pdf[known_mask].groupby("city")[col].median().to_dict()
+    
     lat = pdf["latitude"].astype(float).values
     lon = pdf["longitude"].astype(float).values
     cities = pdf["city"].values
-
-    vals_float = pd.to_numeric(pdf[col], errors="coerce")
-    is_missing = vals_float.isna() | (vals_float <= 0.0)
-    missing_indices = np.where(is_missing)[0]
-    if len(missing_indices) == 0:
-        return pdf
-
-    known_mask = ~is_missing
-    known_indices = np.where(known_mask)[0]
-    if len(known_indices) == 0:
-        pdf[col] = pdf[col].fillna(0)
-        return pdf
-
-    grid_size = 0.018  # ~2km komórka siatki
-    grid = {}
-    for idx in known_indices:
-        key = (int(lat[idx] / grid_size), int(lon[idx] / grid_size))
-        grid.setdefault(key, []).append(idx)
-
-    # City medians for fallback
-    city_medians = pdf[known_mask].groupby("city")[col].median().to_dict()
-    global_median = pdf[known_mask][col].median()
-
-    def _nearby(idx, m_lat, m_lon, m_city):
-        c_lat, c_lon = int(m_lat / grid_size), int(m_lon / grid_size)
-        cands = []
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                cands.extend(grid.get((c_lat + dy, c_lon + dx), []))
-        if not cands:
-            for dy in range(-2, 3):
-                for dx in range(-2, 3):
-                    if abs(dy) > 1 or abs(dx) > 1:
-                        cands.extend(grid.get((c_lat + dy, c_lon + dx), []))
-        return [c for c in cands if c != idx and cities[c] == m_city]
-
-    for idx in missing_indices:
-        m_lat, m_lon = lat[idx], lon[idx]
-        m_city = cities[idx]
-        cands = _nearby(idx, m_lat, m_lon, m_city)
+    vals = pdf[col].astype(float).values
+    
+    unique_cities = pdf["city"].unique()
+    
+    # Proces przebiega niezależnie per miasto
+    for city in unique_cities:
+        city_mask = (cities == city)
+        city_missing_mask = city_mask & is_null
+        city_known_mask = city_mask & known_mask
         
-        fallback_val = city_medians.get(m_city, global_median)
-
-        if not cands:
-            if pd.notna(fallback_val):
-                pdf.at[idx, col] = Decimal(f"{float(fallback_val):.2f}")
-            else:
-                pdf.at[idx, col] = None
+        num_missing = np.sum(city_missing_mask)
+        num_known = np.sum(city_known_mask)
+        
+        if num_missing == 0:
             continue
-
-        c_lats, c_lons = lat[cands], lon[cands]
-        dists = np.sqrt((c_lats - m_lat) ** 2 + (c_lons - m_lon) ** 2)
-
-        min_dist_idx = np.argmin(dists)
-        if dists[min_dist_idx] < 1e-7:
-            neighbor_val = pdf.at[cands[min_dist_idx], col]
-            if pd.notna(neighbor_val):
-                pdf.at[idx, col] = Decimal(f"{float(neighbor_val):.2f}")
-            else:
-                pdf.at[idx, col] = None
+            
+        fallback_val = city_medians.get(city, 0.0)
+        if num_known == 0:
+            pdf.loc[city_missing_mask, col] = fallback_val
             continue
-
-        sort_idx = np.argsort(dists)[:10]
-        top_cands = [cands[i] for i in sort_idx]
-        top_dists = dists[sort_idx]
-
-        weights = 1.0 / top_dists
-        vals = vals_float.iloc[top_cands].values
-        weighted_val = np.sum(weights * vals) / np.sum(weights)
-        if pd.notna(weighted_val):
-            pdf.at[idx, col] = Decimal(f"{float(weighted_val):.2f}")
-        else:
-            pdf.at[idx, col] = None
-
+            
+        m_idx = np.where(city_missing_mask)[0]
+        k_idx = np.where(city_known_mask)[0]
+        
+        m_lat, m_lon = lat[m_idx], lon[m_idx]
+        k_lat, k_lon = lat[k_idx], lon[k_idx]
+        k_vals = vals[k_idx]
+        
+        k_limit = min(10, num_known)
+        batch_size = 1000
+        
+        # Przetwarzanie w bezpiecznych dla RAMu paczkach (batching)
+        for i in range(0, num_missing, batch_size):
+            batch_m_idx = m_idx[i : i + batch_size]
+            batch_m_lat = m_lat[i : i + batch_size]
+            batch_m_lon = m_lon[i : i + batch_size]
+            
+            # Wektorowe obliczanie macierzy odległości przy użyciu broadcasting NumPy
+            dists = np.sqrt((batch_m_lat[:, None] - k_lat) ** 2 + (batch_m_lon[:, None] - k_lon) ** 2)
+            
+            # Wyszukanie 10 najbliższych sąsiadów
+            partitioned_idx = np.argpartition(dists, k_limit - 1, axis=1)[:, :k_limit]
+            
+            row_idx = np.arange(len(batch_m_idx))[:, None]
+            sub_dists = dists[row_idx, partitioned_idx]
+            sorted_sub_idx = np.argsort(sub_dists, axis=1)
+            
+            nearest_partition_idx = partitioned_idx[row_idx, sorted_sub_idx]
+            nearest_dists = dists[row_idx, nearest_partition_idx]
+            
+            # Dodanie małej stałej w celu uniknięcia dzielenia przez zero przy odległości 0m
+            nearest_dists = np.maximum(nearest_dists, 1e-9)
+            weights = 1.0 / nearest_dists
+            
+            # Średnia ważona
+            weighted_vals = np.sum(weights * k_vals[nearest_partition_idx], axis=1)
+            sum_weights = np.sum(weights, axis=1)
+            
+            imputed_vals = np.where(sum_weights > 0, weighted_vals / sum_weights, fallback_val)
+            pdf.loc[pdf.index[batch_m_idx], col] = np.round(imputed_vals, 2)
+        
     return pdf
 
 
-
 # ---------------------------------------------------------------------------
-# Dim_Budynek/Lokal: dominanta per miasto (bez cross-join)
+# Spatial Grid Indexing (K-NN w NumPy)
 # ---------------------------------------------------------------------------
 
 def _impute_spatial_pandas(pdf):
     """
-    Wykonuje przestrzenną imputację cech budynku i udogodnień w Pandas za pomocą
-    szybkiego indeksu siatki (Spatial Grid Index) i NumPy.
+    Uzupełnia braki w cechach budynków (materiał, stan, rok, typ) oraz udogodnieniach
+    przy użyciu zoptymalizowanego indeksu siatki przestrzennej (Spatial Grid Index).
+    
+    1. Cechy budynków (siatka ~2km):
+       - Bliskie sąsiedztwo (<= 150m) -> kopiuje wartość najbliższego lokalu.
+       - Dalsze sąsiedztwo (do 15km) -> moda/mediana z 20 sąsiadów.
+       - Fallback -> dominanta per miasto.
+    2. Udogodnienia (siatka ~100m):
+       - Bardzo bliskie sąsiedztwo (<= 30m) -> kopiuje windę/parking (ten sam blok).
+       - Fallback -> przypisuje "brak".
     """
     lat = pdf["latitude"].astype(float).values
     lon = pdf["longitude"].astype(float).values
     ids = pdf["id"].values
     cities = pdf["city"].values
 
-    # 1. Imputacja cech budynku: buildingmaterial, condition, buildyear
-    #
-    # WAŻNE: każdy atrybut ma własną siatkę kandydatów.
-    # Stara implementacja używała jednej siatki opartej na known_mask = ~(missing_mat | missing_cond | missing_year),
-    # co wykluczało rekord z puli źródeł, jeśli brakowało choćby jednego pola.
-    # Np. rekord z buildingmaterial=brick ale bez condition nie trafiał do puli — stąd masowe "brak informacji".
-    is_missing_mat  = pdf["buildingmaterial"].isna() | (pdf["buildingmaterial"].str.strip().str.lower().isin(["brak informacji", ""]))
-    is_missing_cond = pdf["condition"].isna()         | (pdf["condition"].str.strip().str.lower().isin(["brak informacji", ""]))
+    # Sprawdzenie brakujących wartości
+    is_missing_mat  = pdf["buildingmaterial"].isna() | (pdf["buildingmaterial"].str.strip().isin(["brak informacji", ""]))
+    is_missing_cond = pdf["condition"].isna()         | (pdf["condition"].str.strip().isin(["brak informacji", ""]))
     is_missing_year = pdf["buildyear"].isna()         | (pdf["buildyear"] <= 0)
-    is_missing_type = pdf["type"].isna()              | (pdf["type"].str.strip().str.lower().isin(["brak informacji", ""]))
+    is_missing_type = pdf["type"].isna()              | (pdf["type"].str.strip().isin(["brak informacji", ""]))
     is_missing_bldg = is_missing_mat | is_missing_cond | is_missing_year | is_missing_type
 
-    grid_size = 0.018  # ~2km komórka siatki
+    grid_size = 0.018  # Siatka ~2km do cech budynków
 
-    # Budujemy osobną siatkę dla każdego atrybutu
+    # Tworzenie siatek hash-mapy dla szybkiego dostępu przestrzennego
     def _build_grid(mask):
         g = {}
         for i in np.where(mask)[0]:
@@ -227,47 +246,48 @@ def _impute_spatial_pandas(pdf):
     grid_year = _build_grid(~is_missing_year)
     grid_type = _build_grid(~is_missing_type)
 
-    # Fallback: dominanta/mediana per miasto — też oparta na własnej masce per atrybut
+    # Wyznaczenie globalnych wartości fallback per miasto
     city_mat_mode    = pdf[~is_missing_mat].groupby("city")["buildingmaterial"].agg(
-        lambda x: x.mode().iloc[0] if not x.mode().empty else "Brak informacji").to_dict()
+        lambda x: x.mode().iloc[0] if not x.mode().empty else "brak informacji").to_dict()
     city_cond_mode   = pdf[~is_missing_cond].groupby("city")["condition"].agg(
-        lambda x: x.mode().iloc[0] if not x.mode().empty else "Brak informacji").to_dict()
+        lambda x: x.mode().iloc[0] if not x.mode().empty else "brak informacji").to_dict()
     city_year_median = pdf[~is_missing_year & (pdf["buildyear"] > 0)].groupby("city")["buildyear"].median().to_dict()
     city_type_mode   = pdf[~is_missing_type].groupby("city")["type"].agg(
-        lambda x: x.mode().iloc[0] if not x.mode().empty else "Brak informacji").to_dict()
+        lambda x: x.mode().iloc[0] if not x.mode().empty else "brak informacji").to_dict()
 
     def _nearby(grid, idx, m_lat, m_lon, m_city):
-        """Zwraca listę kandydatów z 3×3 sąsiednich komórek siatki w tym samym mieście."""
+        """Zwraca kandydatów z 9 sąsiednich komórek siatki (3x3) w tym samym mieście."""
         c_lat, c_lon = int(m_lat / grid_size), int(m_lon / grid_size)
         cands = []
         for dy in (-1, 0, 1):
             for dx in (-1, 0, 1):
                 cands.extend(grid.get((c_lat + dy, c_lon + dx), []))
         return [c for c in cands if c != idx and cities[c] == m_city]
-
-    _NEAR_THRESH  = 0.00135   # ~150m — skopiuj dosłownie od 1 sąsiada
-    _VOTE_RADIUS  = 0.135     # ~15km — promień głosowania
+        
+    _NEAR_THRESH  = 0.00135  # ~150 metrów
+    _VOTE_RADIUS  = 0.135    # ~15 kilometrów
     _TOP_K        = 20
-
+    
     def _impute_categorical(idx, m_lat, m_lon, m_city, grid, col, fallback):
         cands = _nearby(grid, idx, m_lat, m_lon, m_city)
         if not cands:
-            return "Brak informacji"
+            return "brak informacji"
         c_lats, c_lons = lat[cands], lon[cands]
         dists = np.sqrt((c_lats - m_lat) ** 2 + (c_lons - m_lon) ** 2)
         nearest = int(np.argmin(dists))
+        # Faza I: Kopiowanie z bliskiego sąsiedztwa
         if dists[nearest] <= _NEAR_THRESH:
             v = pdf.at[cands[nearest], col]
-            if pd.notna(v) and str(v).strip().lower() not in ("brak informacji", ""):
+            if pd.notna(v) and str(v).strip() not in ("brak informacji", ""):
                 return v
+        # Faza II: Głosowanie większościowe z dalszego sąsiedztwa
         valid = np.where(dists <= _VOTE_RADIUS)[0]
         if len(valid) == 0:
-            # Brak sąsiadów w promieniu głosowania — nie zgadujemy
-            return "Brak informacji"
+            return "brak informacji"
         top_k = [cands[i] for i in valid[np.argsort(dists[valid])][:_TOP_K]]
         vals = [pdf.at[i, col] for i in top_k
-                if pd.notna(pdf.at[i, col]) and str(pdf.at[i, col]).strip().lower() not in ("brak informacji", "")]
-        return max(set(vals), key=vals.count) if vals else "Brak informacji"
+                if pd.notna(pdf.at[i, col]) and str(pdf.at[i, col]).strip() not in ("brak informacji", "")]
+        return max(set(vals), key=vals.count) if vals else "brak informacji"
 
     def _impute_year(idx, m_lat, m_lon, m_city):
         cands = _nearby(grid_year, idx, m_lat, m_lon, m_city)
@@ -286,32 +306,33 @@ def _impute_spatial_pandas(pdf):
         years = [pdf.at[i, "buildyear"] for i in top_k if pdf.at[i, "buildyear"] > 0]
         return int(np.median(years)) if years else fallback
 
+    # Uruchomienie imputacji cech budynków
     for idx in np.where(is_missing_bldg)[0]:
         m_lat, m_lon, m_city = lat[idx], lon[idx], cities[idx]
         if is_missing_mat[idx]:
             pdf.at[idx, "buildingmaterial"] = _impute_categorical(
                 idx, m_lat, m_lon, m_city, grid_mat, "buildingmaterial",
-                city_mat_mode.get(m_city, "Brak informacji"))
+                city_mat_mode.get(m_city, "brak informacji"))
         if is_missing_cond[idx]:
             pdf.at[idx, "condition"] = _impute_categorical(
                 idx, m_lat, m_lon, m_city, grid_cond, "condition",
-                city_cond_mode.get(m_city, "Brak informacji"))
+                city_cond_mode.get(m_city, "brak informacji"))
         if is_missing_year[idx]:
             pdf.at[idx, "buildyear"] = _impute_year(idx, m_lat, m_lon, m_city)
         if is_missing_type[idx]:
             pdf.at[idx, "type"] = _impute_categorical(
                 idx, m_lat, m_lon, m_city, grid_type, "type",
-                city_type_mode.get(m_city, "Brak informacji"))
+                city_type_mode.get(m_city, "brak informacji"))
 
 
-    # 2. Imputacja udogodnień: hasparkingspace, hasbalcony, haselevator, hassecurity, hasstorageroom
+    # 2. Imputacja udogodnień (bardzo mały promień siatki - ten sam blok mieszkalny)
     amenity_cols = ["hasparkingspace", "hasbalcony", "haselevator", "hassecurity", "hasstorageroom"]
     is_missing_amenity = pd.Series(False, index=pdf.index)
     for c in amenity_cols:
-        is_missing_amenity |= pdf[c].isna() | (pdf[c].str.strip().str.lower().isin(["brak informacji", "brak", ""]))
+        is_missing_amenity |= pdf[c].isna() | (pdf[c].str.strip() == "brak informacji") | (pdf[c].str.strip() == "")
 
     known_mask_am = ~is_missing_amenity
-    grid_size_30m = 0.0009  # 100m
+    grid_size_30m = 0.0009  # Siatka ~100m
 
     grid_am = {}
     for idx in np.where(known_mask_am)[0]:
@@ -336,7 +357,7 @@ def _impute_spatial_pandas(pdf):
                     candidates.extend(grid_am[key])
 
         candidates = [c for c in candidates if c != idx and cities[c] == m_city]
-        imputed_vals = {c: "Brak informacji" for c in amenity_cols}
+        imputed_vals = {c: "brak" for c in amenity_cols}
 
         if candidates:
             c_lats = lat[candidates]
@@ -344,19 +365,17 @@ def _impute_spatial_pandas(pdf):
             dists = np.sqrt((c_lats - m_lat)**2 + (c_lons - m_lon)**2)
 
             min_dist_idx = np.argmin(dists)
-            if dists[min_dist_idx] <= 0.00027:  # 30m
+            if dists[min_dist_idx] <= 0.00027:  # Promień 30 metrów (ten sam blok)
                 nearest_idx = candidates[min_dist_idx]
                 for c in amenity_cols:
                     imputed_vals[c] = pdf.at[nearest_idx, c]
 
         for c in amenity_cols:
-            is_miss = pd.isna(pdf.at[idx, c]) or str(pdf.at[idx, c]).strip().lower() in ("brak informacji", "brak", "")
+            is_miss = pd.isna(pdf.at[idx, c]) or str(pdf.at[idx, c]).strip() in ("brak informacji", "")
             if is_miss:
                 pdf.at[idx, c] = imputed_vals[c]
 
-    # Upewnijmy się, że buildyear nie ma wartości NaN i jest typu int
     pdf["buildyear"] = pdf["buildyear"].fillna(2000).astype(int)
-
     return pdf
 
 
@@ -365,7 +384,7 @@ def _impute_spatial_pandas(pdf):
 # ---------------------------------------------------------------------------
 
 def _warn_date_gaps(df):
-    """Print a warning for each missing month in the source_date sequence."""
+    """Wyświetla ostrzeżenie diagnostyczne [WARN] w przypadku wykrycia dziur (brakujących miesięcy) w chronologii."""
     rows = df.select("source_date").distinct().orderBy("source_date").collect()
     parsed = sorted(
         {datetime.strptime(str(r["source_date"])[:7], "%Y-%m") for r in rows if r["source_date"]}
@@ -392,35 +411,51 @@ def main():
     )
     spark.sparkContext.setLogLevel("WARN")
 
-    # --- demografia ---
+    # --- 1. Oczyszczanie danych demograficznych ---
     df_demo, url, user, pwd = _pg_opts(spark, "demografia")
     df_demo = _clean_demografia(df_demo)
     df_demo = df_demo.localCheckpoint()
     _write_postgres(df_demo, "demografia", url, user, pwd)
     print(f"Clean OK: stg.demografia ({df_demo.count()} wierszy)")
 
-    # --- apartments ---
+    # --- 2. Oczyszczanie i przestrzenna imputacja ofert mieszkań ---
     df_apt, url, user, pwd = _pg_opts(spark, "apartments")
 
-    # Spatial building attributes, amenities and distance IDW imputation via Pandas
-    pdf_apt = df_apt.toPandas()
-    for dist_col in _DISTANCE_COLS:
-        pdf_apt = _impute_idw_pandas(pdf_apt, dist_col)
-    pdf_apt = _impute_spatial_pandas(pdf_apt)
+    schema_cols = df_apt.columns
+    int_fields = [f.name for f in df_apt.schema.fields if isinstance(f.dataType, IntegerType)]
+    decimal_fields = [(f.name, f.dataType.scale) for f in df_apt.schema.fields if isinstance(f.dataType, DecimalType)]
 
-    # Cast IntegerType columns explicitly to Python int/None to avoid float64/NaN issues
-    for field in df_apt.schema.fields:
-        col_name = field.name
-        if col_name in pdf_apt.columns and isinstance(field.dataType, IntegerType):
-            pdf_apt[col_name] = pdf_apt[col_name].astype(object)
-            pdf_apt.loc[pdf_apt[col_name].notnull(), col_name] = pdf_apt.loc[pdf_apt[col_name].notnull(), col_name].astype(int)
+    # Dystrybucja i zrównoleglenie skomplikowanych obliczeń przestrzennych na executorach Spark
+    def clean_group(key, pdf):
+        from decimal import Decimal
 
-    # Convert the entire DataFrame to object type and replace NaN/NaT with None for Spark compatibility
-    pdf_apt = pdf_apt.astype(object).where(pdf_apt.notnull(), None)
-    df_apt = spark.createDataFrame(pdf_apt[df_apt.columns], schema=df_apt.schema)
+        # Imputacja IDW odległości w Pandas
+        for dist_col in _DISTANCE_COLS:
+            pdf = _idw_impute_pandas(pdf, dist_col)
+
+        # Imputacja cech budynków za pomocą Spatial Grid Index
+        pdf = _impute_spatial_pandas(pdf)
+
+        # Rzutowanie typów w Pandas w celu uniknięcia niezgodności typów PyArrow z silnikiem Spark
+        for col_name in int_fields:
+            if col_name in pdf.columns:
+                pdf[col_name] = pd.to_numeric(pdf[col_name], errors='coerce')
+                pdf[col_name] = pdf[col_name].astype(object).where(pdf[col_name].notnull(), None)
+                pdf.loc[pdf[col_name].notnull(), col_name] = pdf.loc[pdf[col_name].notnull(), col_name].astype(int)
+
+        for col_name, scale in decimal_fields:
+            if col_name in pdf.columns:
+                pdf[col_name] = pd.to_numeric(pdf[col_name], errors='coerce')
+                pdf[col_name] = pdf[col_name].apply(lambda x: Decimal(f"{x:.{scale}f}") if pd.notna(x) else None)
+
+        pdf = pdf.astype(object).where(pdf.notnull(), None)
+        return pdf[schema_cols]
+
+    # Uruchomienie czyszczenia w podziale per miasto
+    df_apt = df_apt.groupBy("city").applyInPandas(clean_group, schema=df_apt.schema)
     df_apt = df_apt.localCheckpoint()
 
-    # Final quality check
+    # Ostateczny filtr jakości po imputacji
     df_apt = df_apt.filter(
         F.col("squaremeters").cast("double").between(10, 300) &
         (F.col("price").cast("double") > 0)
@@ -429,6 +464,7 @@ def main():
     _write_postgres(df_apt, "apartments", url, user, pwd)
     print(f"Clean OK: stg.apartments ({df_apt.count()} wierszy)")
 
+    # Wykrywanie luk chronologicznych
     _warn_date_gaps(df_apt)
 
     spark.stop()

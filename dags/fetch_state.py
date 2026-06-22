@@ -1,14 +1,18 @@
-"""Ekstrakcja: uruchom skrypt i waliduj."""
+"""
+Moduł odpowiedzialny za walidację poprawności wczytywanych danych wejściowych ("Pandas Split Engine")
+oraz zarządzanie uruchamianiem skryptów ekstrakcji w ramach orkiestracji Airflow.
+"""
 
 import subprocess
 from pathlib import Path
-
 import pandas as pd
 
+# Ustalenie katalogu głównego projektu w zależności od środowiska (lokalne vs Airflow Docker)
 _ROOT = Path("/opt/airflow") if Path("/opt/airflow/dags").exists() else Path(__file__).resolve().parents[1]
 _DATA = _ROOT / "data"
 
-# script, args, sep, patterns, required_cols, date_col, dedup_keys, validators[(col, fn, reason)]
+# Definicje źródeł danych: skrypty, argumenty, separatory, oczekiwane kolumny,
+# klucze unikalne do deduplikacji oraz reguły walidacyjne (Pandas Split Engine)
 _SOURCES = {
     "real_estate": (
         "get_real_estate_data.py", [], ",",
@@ -40,10 +44,12 @@ _SOURCES = {
 
 
 class ExtractionError(Exception):
+    """Wyjątek zgłaszany w przypadku krytycznych błędów pobierania lub walidacji danych."""
     pass
 
 
 def _scripts_dir() -> Path:
+    """Zwraca absolutną ścieżkę do katalogu ze skryptami Pythona."""
     for path in (_ROOT / "scripts", Path(__file__).resolve().parents[1] / "scripts"):
         if path.is_dir():
             return path
@@ -51,27 +57,48 @@ def _scripts_dir() -> Path:
 
 
 def _glob(pattern: str) -> list[Path]:
+    """Pomocnicza metoda do wyszukiwania plików (glob) na podstawie wzorca tekstowego."""
     return sorted(_ROOT.glob(pattern)) if "*" in pattern else [_ROOT / pattern]
 
 
 def _split(df: pd.DataFrame, req: list[str], date_col: str | None, keys: list[str] | None, validators: list | None = None) -> pd.DataFrame:
+    """
+    Pandas Split Engine: Waliduje wiersze ramki danych Pandas.
+    Identyfikuje rekordy z brakami w kluczowych polach, brakami dat, duplikatami oraz
+    błędami logicznymi zdefiniowanymi w regułach 'validators'.
+    Zwraca przefiltrowaną, poprawną ramkę danych.
+    """
     empty = lambda s: s.isna() | (s.astype(str).str.strip() == "")
     reasons = pd.Series("", index=df.index, dtype="object")
+    
+    # Weryfikacja obecności wymaganych kolumn
     for col in req:
         if col in df.columns:
             reasons = reasons.where(~empty(df[col]), reasons + f"brak_{col};")
+            
+    # Weryfikacja obecności poprawnej daty
     if date_col and date_col in df.columns:
         reasons = reasons.where(~empty(df[date_col]), reasons + "brak_daty;")
+        
+    # Weryfikacja i eliminacja duplikatów (na podstawie zdefiniowanych kluczy unikalnych)
     if keys and all(c in df.columns for c in keys):
         reasons = reasons.where(~df.duplicated(subset=keys, keep="first"), reasons + "duplikat;")
+        
+    # Uruchamianie dodatkowych walidatorów (np. zakres powierzchni, dodatnia cena)
     for col, fn, reason in (validators or []):
         if col in df.columns:
             reasons = reasons.where(fn(df[col]), reasons + f"{reason};")
+            
+    # Odrzucenie wadliwych rekordów (posiadających jakikolwiek zapisany kod błędu w 'reasons')
     bad = reasons.str.strip() != ""
     return df[~bad].copy()
 
 
 def get_latest_month_from_db() -> str | None:
+    """
+    Łączy się bezpośrednio z PostgreSQL, aby sprawdzić najnowszy załadowany miesiąc (source_date).
+    Służy do przyrostowego pobierania danych o nieruchomościach z Kaggle.
+    """
     import os
     import psycopg2
     
@@ -91,7 +118,7 @@ def get_latest_month_from_db() -> str | None:
             port=pg_port
         )
         with conn.cursor() as cur:
-            # Sprawdzamy czy tabela prod.dim_czas istnieje i ma rekordy
+            # 1. Sprawdzamy czy tabela prod.dim_czas istnieje i ma rekordy
             cur.execute("""
                 SELECT EXISTS (
                     SELECT FROM information_schema.tables 
@@ -103,9 +130,9 @@ def get_latest_month_from_db() -> str | None:
                 cur.execute("SELECT MAX(source_date) FROM prod.dim_czas;")
                 res = cur.fetchone()
                 if res and res[0]:
-                    return str(res[0])[:7]
+                    return str(res[0])[:7]  # Zwraca format YYYY-MM
             
-            # Sprawdzamy czy tabela stg.apartments istnieje i ma rekordy
+            # 2. Sprawdzamy czy tabela stg.apartments istnieje (fallback)
             cur.execute("""
                 SELECT EXISTS (
                     SELECT FROM information_schema.tables 
@@ -117,7 +144,6 @@ def get_latest_month_from_db() -> str | None:
                 cur.execute("SELECT MAX(source_date) FROM stg.apartments;")
                 res = cur.fetchone()
                 if res and res[0]:
-                    # source_date to VARCHAR(10) w formacie YYYY-MM-DD
                     return str(res[0])[:7]
     except Exception as e:
         print(f"Error querying database for latest month: {e}")
@@ -128,6 +154,11 @@ def get_latest_month_from_db() -> str | None:
 
 
 def run_extract(source_id: str, check_existing: bool = True) -> int:
+    """
+    Uruchamia skrypt ekstrakcji dla wybranego źródła danych i przeprowadza walidację Pandas.
+    Wspiera przyrostowość (pyta bazę danych o ostatni miesiąc i przekazuje go do parametru --after).
+    W przypadku braku nowych danych w Airflow rzuca AirflowSkipException.
+    """
     import os
     script, args, sep, patterns, req, date_col, keys, validators = _SOURCES[source_id]
     errors, rows_ok = [], 0
@@ -136,14 +167,14 @@ def run_extract(source_id: str, check_existing: bool = True) -> int:
     force_full_load = os.environ.get("FORCE_FULL_LOAD", "false").lower() == "true"
     
     latest_month = None
+    # Pobieranie przyrostowe dla rynku nieruchomości
     if source_id == "real_estate" and not force_full_load:
         latest_month = get_latest_month_from_db()
         if latest_month:
             run_args.extend(["--after", latest_month])
             print(f"[{source_id}] Znaleziono ostatni miesiąc w bazie: {latest_month}. Pobieram tylko nowsze dane.")
 
-    # Sprawdzamy czy pliki już istnieją i mają rozmiar > 0
-    # W przypadku przyrostowego ładowania nieruchomości zawsze odpalamy skrypt pobierania
+    # Zapobieganie wielokrotnemu pobieraniu tych samych plików
     if check_existing:
         if source_id == "real_estate" and not force_full_load and latest_month:
             files_exist = False
@@ -155,6 +186,7 @@ def run_extract(source_id: str, check_existing: bool = True) -> int:
     else:
         files_exist = False
 
+    # Pobieranie danych skryptem zewnętrznym, jeśli pliki nie istnieją
     if files_exist:
         print(f"[{source_id}] Pliki już istnieją, pomijam pobieranie.")
     else:
@@ -163,6 +195,7 @@ def run_extract(source_id: str, check_existing: bool = True) -> int:
         except subprocess.CalledProcessError as exc:
             raise ExtractionError(f"[{source_id}] {exc}") from exc
 
+    # Wczytanie i walidacja wyjściowych plików CSV za pomocą Pandas Split Engine
     frames = [
         (path, pd.read_csv(path, sep=sep, encoding="utf-8-sig"))
         for pattern in patterns
@@ -185,6 +218,7 @@ def run_extract(source_id: str, check_existing: bool = True) -> int:
             errors.append(f"{path.name}: pusty plik")
             continue
 
+        # Uruchomienie filtracji na ramce danych Pandas
         good = _split(df, req, date_col, keys, validators)
 
         if not good.empty:

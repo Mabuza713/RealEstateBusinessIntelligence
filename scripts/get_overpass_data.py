@@ -1,3 +1,8 @@
+"""
+Skrypt pobierający punkty użyteczności publicznej (POI) z OpenStreetMap za pomocą Overpass API.
+Odpowiada za warstwę ekstrakcji (RAW) dla lokalizacji kawiarni, parkingów i przystanków autobusowych.
+"""
+
 import csv
 import os
 import time
@@ -5,14 +10,21 @@ import urllib.request
 import overpy
 import socket
 
+# Ustawienie limitu czasu dla połączeń sieciowych socket
 socket.setdefaulttimeout(60)
 
+# Konfiguracja nagłówka User-Agent w celu uniknięcia blokowania zapytań przez OSM
 opener = urllib.request.build_opener()
 opener.addheaders = [("User-agent", "WyszukiwarkaOSM/1.0 (testowy-skrypt)")]
 urllib.request.install_opener(opener)
 
 
 def FetchAndAppendPoints(city, point_type, key, filename):
+    """
+    Formułuje i wysyła zapytanie Overpass QL dla wybranego miasta i kategorii POI.
+    Zapisuje pobrane wyniki bezpośrednio do pliku CSV (zabezpieczając jednokrotny zapis nagłówka).
+    """
+    # Konstruowanie zapytania Overpass QL z filtrowaniem według obszaru miasta i klucza tagu OSM
     query = f"""
     [out:json][timeout:180];
     area[name="{city}"]->.searchArea;
@@ -20,6 +32,7 @@ def FetchAndAppendPoints(city, point_type, key, filename):
     out;
     """
 
+    # Lista serwerów lustrzanych Overpass API w celu zwiększenia odporności na limity i niedostępność
     endpoints = [
         "https://overpass.kumi.systems/api/interpreter",
         "https://overpass-api.de/api/interpreter",
@@ -27,6 +40,7 @@ def FetchAndAppendPoints(city, point_type, key, filename):
     ]
 
     result = None
+    # Rotacja serwerów w przypadku niepowodzenia
     for url in endpoints:
         try:
             print(f"  Próba pobrania dla miasta {city} ({point_type}) z serwera: {url}...")
@@ -53,10 +67,10 @@ def FetchAndAppendPoints(city, point_type, key, filename):
         if os.path.dirname(filename):
             os.makedirs(os.path.dirname(filename), exist_ok=True)
 
-        # Sprawdzamy, czy plik już istnieje i ma zawartość, aby zdecydować o nagłówku
+        # Sprawdzamy, czy plik już istnieje i ma zawartość, aby zdecydować o zapisie nagłówka
         file_exists = os.path.isfile(filename) and os.path.getsize(filename) > 0
 
-        # Otwieramy w trybie dopisywania ('a' - append)
+        # Otwieramy plik w trybie dopisywania ('a' - append), aby łączyć dane z kolejnych miast
         with open(
             filename, mode="a", newline="", encoding="utf-8-sig"
         ) as csv_file:
@@ -65,7 +79,7 @@ def FetchAndAppendPoints(city, point_type, key, filename):
                 csv_file, fieldnames=fieldnames, delimiter=";"
             )
 
-            # Nagłówek zapisze się tylko raz – przy pierwszym dodawaniu danych do czystego pliku
+            # Nagłówek zapisze się tylko raz – przy pierwszym dodawaniu danych do pustego pliku
             if not file_exists:
                 writer.writeheader()
 
@@ -92,6 +106,7 @@ def FetchAndAppendPoints(city, point_type, key, filename):
 
 
 if __name__ == "__main__":
+    # Analizowana lista 15 głównych polskich miast
     cities = [
         "Warszawa",
         "Kraków",
@@ -110,14 +125,14 @@ if __name__ == "__main__":
         "Częstochowa",
     ]
 
-    # Definiujemy ścieżki do trzech zbiorczych plików
+    # Definiujemy ścieżki do trzech zbiorczych plików dla kategorii POI
     output_files = {
         "cafe": "../data/raw/all_cafes.csv",
         "parking": "../data/raw/all_parkings.csv",
         "bus_stop": "../data/raw/all_bus_stops.csv",
     }
 
-    # WAŻNE: Czyścimy stare pliki na początku uruchomienia programu.
+    # WAŻNE: Czyścimy stare pliki na początku uruchomienia programu, aby uniknąć duplikowania przy restarcie
     for path in output_files.values():
         if os.path.exists(path):
             try:
@@ -125,13 +140,13 @@ if __name__ == "__main__":
             except Exception:
                 pass
 
-    # Główna pętla przechodząca przez miasta
+    # Główna pętla pobierania danych z zachowaniem przerw czasowych w celu uniknięcia banowania IP (throttling)
     for city in cities:
         print(f"\nRozpoczynam pobieranie danych dla miasta: {city}")
 
         # 1. Kawiarnie
         FetchAndAppendPoints(city, "cafe", "amenity", output_files["cafe"])
-        time.sleep(2)  # Krótka przerwa między zapytaniami w jednym mieście
+        time.sleep(2)  # Krótka przerwa między zapytaniami w obrębie jednego miasta
 
         # 2. Parkingi
         FetchAndAppendPoints(

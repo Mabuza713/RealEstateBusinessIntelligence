@@ -1,4 +1,9 @@
-"""Spark: clean -> staging (parquet). Bez wymiarow i faktow - tylko przygotowanie danych."""
+"""
+Krok I potoku transformacji Sparka: Staging.
+Skrypt wczytuje surowe pliki CSV, normalizuje nazwy miast, filtruje niepoprawne rekordy,
+tłumaczy słowniki na polski, wylicza odległości geograficzne do POI wzorem Haversine
+oraz zapisuje dane do tabel stagingowych (stg.*) w PostgreSQL za pomocą JDBC.
+"""
 
 import os
 from functools import reduce
@@ -7,12 +12,14 @@ from pathlib import Path
 from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.types import DecimalType, IntegerType
 
+# Mapowanie typów punktów użyteczności publicznej na pliki źródłowe CSV
 POI_FILES = [
     ("cafe", "all_cafes.csv"),
     ("parking", "all_parkings.csv"),
     ("bus_stop", "all_bus_stops.csv"),
 ]
 
+# Kolumny określające udogodnienia w ofertach mieszkań
 APT_AMENITY_COLS = [
     "hasParkingSpace",
     "hasBalcony",
@@ -21,11 +28,13 @@ APT_AMENITY_COLS = [
     "hasStorageRoom",
 ]
 
+# Kolumny tekstowe w ofertach mieszkań podlegające unifikacji słownikowej
 APT_TEXT_COLS = ["buildingMaterial", "condition", "ownership", "type"]
 
 
 # --- helpers -----------------------------------------------------------------
 def _root() -> str:
+    """Określa i weryfikuje ścieżkę do katalogu głównego z danymi (data/)."""
     candidates = (
         os.environ.get("DATA_ROOT"),
         "/opt/airflow/data",
@@ -38,10 +47,15 @@ def _root() -> str:
 
 
 def _union(dfs):
+    """Pomocnicze scalanie wielu ramek danych PySpark za pomocą unionByName (FK-safe dla brakujących kolumn)."""
     return reduce(lambda left, right: left.unionByName(right, allowMissingColumns=True), dfs)
 
 
 def _csv(spark, path, sep=","):
+    """
+    Wczytuje plik CSV. Obsługuje również usuwanie znacznika BOM (\ufeff)
+    z pierwszej kolumny, co bywa częstym problemem w plikach CSV kodowanych w UTF-8.
+    """
     df = spark.read.option("header", True).option("sep", sep).csv(path)
     if df.columns and df.columns[0].startswith('\ufeff'):
         df = df.withColumnRenamed(df.columns[0], df.columns[0][1:])
@@ -49,30 +63,44 @@ def _csv(spark, path, sep=","):
 
 
 def _glob_one(folder, pattern):
+    """Wyszukuje i zwraca ścieżkę do pierwszego pliku pasującego do wzorca (glob)."""
     return str(next(Path(folder).glob(pattern)))
 
 
 def _write(df, path):
+    """Zapisuje ramkę danych Spark do formatu Parquet (opcja nadpisywania)."""
     df.write.mode("overwrite").parquet(path)
 
 
 def _norm_city(col):
+    """
+    Normalizacja nazw miast:
+    Usuwa spacje skrajne, zamienia litery na małe oraz konwertuje polskie znaki diakrytyczne na ich łacińskie odpowiedniki.
+    Ułatwia to poprawne złączanie (join) danych z różnych źródeł (Kaggle, GUS, OSM).
+    """
     lowered = F.lower(F.trim(col))
     return F.translate(lowered, "ąćęłńóśźż", "acelnoszz")
 
 
 def _missing_label(col, label="brak informacji"):
+    """Zastępuje wartości puste (NULL) lub puste ciągi znakowe zdefiniowaną etykietą."""
     empty = col.isNull() | (F.trim(col.cast("string")) == "")
     return F.when(empty, F.lit(label)).otherwise(F.trim(col.cast("string")))
 
 
 def _round_num(col, scale=2):
+    """Rzutuje kolumnę na double i zaokrągla do określonej liczby miejsc po przecinku."""
     c = F.col(col) if isinstance(col, str) else col
     return F.round(c.cast("double"), scale)
 
 
 # --- staging: apartments (Dim_Lokal, Dim_Budynek, Dim_Czas) ------------------
 def _get_latest_month_from_db(spark):
+    """
+    Odpytuje bazę danych PostgreSQL przez JDBC w celu pobrania maksymalnej
+    daty source_date w tabeli produkcyjnej lub stagingowej.
+    Wspomaga filtrowanie przyrostowe na poziomie transformacji Spark.
+    """
     pg_user = os.environ.get("POSTGRES_USER", "postgres")
     pg_password = os.environ.get("POSTGRES_PASSWORD", "postgres")
     pg_db = os.environ.get("POSTGRES_DB", "postgres")
@@ -81,7 +109,7 @@ def _get_latest_month_from_db(spark):
 
     url = f"jdbc:postgresql://{pg_host}:{pg_port}/{pg_db}"
 
-    # Sprawdzamy prod.dim_czas
+    # Sprawdzamy tabelę produkcyjną prod.dim_czas
     try:
         df = spark.read \
             .format("jdbc") \
@@ -97,7 +125,7 @@ def _get_latest_month_from_db(spark):
     except Exception:
         pass
 
-    # Sprawdzamy stg.apartments
+    # Fallback: sprawdzamy tabelę stagingową stg.apartments
     try:
         df = spark.read \
             .format("jdbc") \
@@ -117,6 +145,11 @@ def _get_latest_month_from_db(spark):
 
 
 def _stage_apartments(spark, src_dir):
+    """
+    Ładuje surowe pliki ofert mieszkań (sprzedaż i wynajem), scala je,
+    rzutuje typy danych, normalizuje i standaryzuje słowniki wartości tekstowych na język polski
+    oraz filtruje niepoprawne wiersze.
+    """
     sources = [
         _csv(spark, f"{src_dir}/all_apartments_{kind}.csv").withColumn("listing_type", F.lit(kind))
         for kind in ("sell", "rent")
@@ -129,7 +162,7 @@ def _stage_apartments(spark, src_dir):
         .withColumn("source_date", F.to_date("source_date", "yyyy-MM"))
     )
 
-    # Filtracja przyrostowa na poziomie transformacji
+    # Przyrostowość: odrzucamy rekordy z datami mniejszymi bądź równymi ostatnio załadowanej
     force_full_load = os.environ.get("FORCE_FULL_LOAD", "false").lower() == "true"
     if not force_full_load:
         latest_month = _get_latest_month_from_db(spark)
@@ -157,7 +190,7 @@ def _stage_apartments(spark, src_dir):
         .withColumn("centre_distance", _round_num("centreDistance"))
     )
 
-    # Map values to Polish and manager-friendly names
+    # Tłumaczenie i ujednolicanie słowników na język polski
     df = (
         df
         .withColumn("listing_type",
@@ -193,6 +226,7 @@ def _stage_apartments(spark, src_dir):
         )
     )
 
+    # Ujednolicanie cech udogodnień
     for col in APT_AMENITY_COLS:
         if col in df.columns:
             df = df.withColumn(col,
@@ -206,6 +240,7 @@ def _stage_apartments(spark, src_dir):
     for col in distance_cols:
         df = df.withColumn(col, _round_num(col))
 
+    # Odrzucanie rekordów niespełniających kryteriów jakościowych (kwalifikacja danych wejściowych)
     return (
         df
         .filter(
@@ -222,6 +257,10 @@ def _stage_apartments(spark, src_dir):
 
 # --- staging: demografia (Dim_Demografia) ------------------------------------
 def _stage_demografia(spark, src_dir):
+    """
+    Wczytuje surowy plik danych demograficznych GUS BDL, normalizuje nazwy miast,
+    rzutuje typy wskaźników statystycznych i eliminuje duplikaty.
+    """
     return (
         _csv(spark, _glob_one(src_dir, "baza_bi_miasta_*.csv"))
         .withColumn("city_norm", _norm_city("Glowne_Miasto"))
@@ -249,6 +288,7 @@ def _stage_demografia(spark, src_dir):
 
 # --- staging: POI (źródło Dim_Infrastruktura) --------------------------------
 def _stage_poi(spark, src_dir):
+    """Scalanie plików kawiarni, parkingów i przystanków OSM w jedną spójną tabelę POI."""
     sources = [
         _csv(spark, f"{src_dir}/{filename}", ";")
         .withColumn("poi_type", F.lit(poi_type))
@@ -272,7 +312,7 @@ def _stage_poi(spark, src_dir):
         )
     )
 
-# --- database ----------------------------------------------------------------
+# --- database columns specification ------------------------------------------
 _DB_COLUMNS = {
     "apartments": [
         "id", "city", "type", "squaremeters", "rooms", "floor", "floorcount", "buildyear",
@@ -294,6 +334,11 @@ _DB_COLUMNS = {
 
 
 def _write_postgres(df, table_name):
+    """
+    Zapisuje ramkę danych Spark do bazy danych PostgreSQL.
+    Mapuje nazwy kolumn, rzutuje daty na format tekstowy w celu uniknięcia rozszerzeń stref czasowych
+    przez sterownik JDBC oraz realizuje zapis w trybie overwrite z truncate.
+    """
     pg_user = os.environ.get("POSTGRES_USER", "postgres")
     pg_password = os.environ.get("POSTGRES_PASSWORD", "postgres")
     pg_db = os.environ.get("POSTGRES_DB", "postgres")
@@ -302,7 +347,7 @@ def _write_postgres(df, table_name):
 
     url = f"jdbc:postgresql://{pg_host}:{pg_port}/{pg_db}"
 
-    # Rename clean columns to match Postgres schema column names and resolve ambiguity
+    # Zmiana nazw kolumn na małe litery, aby zachować spójność z bazą PostgreSQL
     if table_name == "apartments":
         df = df.drop("squareMeters", "buildYear", "centreDistance")
         df = df.withColumnRenamed("square_meters", "squaremeters") \
@@ -317,14 +362,12 @@ def _write_postgres(df, table_name):
                .withColumnRenamed("latitude", "lat") \
                .withColumnRenamed("longitude", "lon")
 
-    # Lowercase all DataFrame column names to match the case-sensitive lowercase Postgres tables
     df = df.toDF(*[c.lower() for c in df.columns])
 
     columns = _DB_COLUMNS.get(table_name)
     if columns:
         df = df.select(*columns)
 
-    # Cast source_date to string to prevent JDBC formatting timezone extensions (e.g. '2024-04-01 +00')
     if "source_date" in df.columns:
         df = df.withColumn("source_date", F.col("source_date").cast("string"))
 
@@ -352,25 +395,24 @@ def main():
     )
     spark.sparkContext.setLogLevel("WARN")
 
-    # Load and clean tables directly from raw (Spark filters apply)
+    # 1. Wstępne wczytanie i oczyszczenie tabel ze stagingu
     apt_df = _stage_apartments(spark, raw_dir)
     demografia_df = _stage_demografia(spark, raw_dir)
     poi_df = _stage_poi(spark, raw_dir)
 
-    # Calculate distances to nearest POIs: cafe, parking, bus_stop
+    # 2. Obliczanie odległości do najbliższych kawiarni, parkingów i przystanków OSM (Wzór Haversine)
     filtered_poi = poi_df.filter(F.col("poi_type").isin("cafe", "parking", "bus_stop")) \
                          .select(F.col("city_norm").alias("_poi_city"), 
-                                 F.col("poi_type").alias("_poi_type"),
-                                 F.col("latitude").alias("_poi_lat"), 
-                                 F.col("longitude").alias("_poi_lon"))
+                                  F.col("poi_type").alias("_poi_type"),
+                                  F.col("latitude").alias("_poi_lat"), 
+                                  F.col("longitude").alias("_poi_lon"))
     
-    # Join on city_norm — używamy apt_for_poi (pochodnego DF) zamiast apt_df["city_norm"],
-    # bo Spark nie może rozwiązać kolumny z zewnętrznego DF w kontekście pochodnego.
+    # Do złączenia tworzymy odchudzoną wersję tabeli mieszkań
     apt_for_poi = apt_df.select("id", "listing_type", "source_date", "city_norm", "latitude", "longitude")
     joined = apt_for_poi.join(filtered_poi, apt_for_poi["city_norm"] == filtered_poi["_poi_city"], "left")
     
-    # Haversine distance in km
-    r = 6371.0
+    # Wyznaczenie odległości na sferze wzorem Haversine
+    r = 6371.0  # Promień Ziemi w km
     lat1 = F.radians(F.col("latitude"))
     lon1 = F.radians(F.col("longitude"))
     lat2 = F.radians(F.col("_poi_lat"))
@@ -383,7 +425,7 @@ def main():
     c = 2.0 * F.atan2(F.sqrt(a), F.sqrt(1.0 - a))
     dist = r * c
     
-    # Group by unique keys and aggregate minimum distance per POI type
+    # Agregacja odległości: wybieramy najmniejszy dystans dla każdego typu POI
     min_dist_df = joined.withColumn("_dist", dist) \
                         .groupBy("id", "listing_type", "source_date") \
                         .agg(
@@ -392,8 +434,7 @@ def main():
                             F.round(F.min(F.when(F.col("_poi_type") == "bus_stop", F.col("_dist"))), 3).alias("busstopDistance")
                         )
     
-    # Rename original distance columns (if present in the raw CSV) to temp names so
-    # the join below does not produce duplicate/ambiguous column names.
+    # Zmiana nazw oryginalnych kolumn odległości, aby uniknąć konfliktów przy złączeniu
     _orig_cols = {"caffeDistance": "_orig_caffedistance",
                   "parkingDistance": "_orig_parkingdistance",
                   "busstopDistance": "_orig_busstopdistance"}
@@ -401,11 +442,10 @@ def main():
         if _src in apt_df.columns:
             apt_df = apt_df.withColumnRenamed(_src, _tmp)
 
-    # Join freshly computed distances (caffeDistance / parkingDistance / busstopDistance)
+    # Złączenie obliczonych odległości z ramką mieszkań
     apt_df = apt_df.join(min_dist_df, on=["id", "listing_type", "source_date"], how="left")
 
-    # Coalesce: prefer the POI-computed value; fall back to the original CSV value when
-    # the POI file is missing or city_norm did not match (e.g. empty all_bus_stops.csv).
+    # Scalanie wyliczonych wartości z oryginalnymi (coalesce zapewnia fallback)
     for _new, _tmp in [("caffeDistance",   "_orig_caffedistance"),
                         ("parkingDistance", "_orig_parkingdistance"),
                         ("busstopDistance", "_orig_busstopdistance")]:
@@ -418,7 +458,7 @@ def main():
         "poi": poi_df,
     }
 
-    # Write clean records to PostgreSQL
+    # 3. Zapis do PostgreSQL
     for name, df in tables.items():
         _write_postgres(df, name)
         print(f"PostgreSQL OK: stg.{name} ({df.count()} wierszy)")
